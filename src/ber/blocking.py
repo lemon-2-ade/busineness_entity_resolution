@@ -147,7 +147,16 @@ def _pair_cos(A, B, r, c, chunk=2_000_000):
     return out
 
 
-def search_block(X, rows1, rows23, ks, caps, threads, chunk=50_000):
+def _truncate(u: pl.DataFrame, keep) -> pl.DataFrame:
+    """Rank candidates of each S1 row (r) by the three cosines and keep the
+    union of joint-top keep[0], name-top keep[1], addr-top keep[2]."""
+    u = u.with_columns(((pl.col('blk_name') + pl.col('blk_addr')) / 2).alias('blk_joint'))
+    u = u.with_columns([pl.col(f'blk_{v}').rank('ordinal', descending=True).over('r').cast(pl.Int16)
+                        .alias(f'rk_{v}') for v in ('joint', 'name', 'addr')])
+    return u.filter((pl.col('rk_joint') <= keep[0]) | (pl.col('rk_name') <= keep[1]) | (pl.col('rk_addr') <= keep[2]))
+
+
+def search_block(X, rows1, rows23, ks, caps, threads, keep, chunk=50_000):
     """Top-k retrieval of S1 rows `rows1` against S23 rows `rows23` for the
     three views.  Returns frame (r, c, blk_name, blk_addr) with *global* row
     numbers (within the country frame)."""
@@ -168,8 +177,9 @@ def search_block(X, rows1, rows23, ks, caps, threads, chunk=50_000):
             lists.append(pl.DataFrame({'r': C.row.astype(np.int64) + i, 'c': C.col.astype(np.int64)}))
         u = pl.concat(lists).unique()
         r, c = u['r'].to_numpy(), u['c'].to_numpy()
-        out.append(pl.DataFrame({'r': rows1[r], 'c': rows23[c],
-                                 'blk_name': _pair_cos(An, Bn, r, c), 'blk_addr': _pair_cos(Aa, Ba, r, c)}))
+        u = pl.DataFrame({'r': rows1[r].astype(np.int32), 'c': rows23[c].astype(np.int32),
+                          'blk_name': _pair_cos(An, Bn, r, c), 'blk_addr': _pair_cos(Aa, Ba, r, c)})
+        out.append(_truncate(u, keep).select('r', 'c', 'blk_name', 'blk_addr'))
     return pl.concat(out)
 
 
@@ -180,62 +190,70 @@ STATE_ALIAS = {'state_tg': 'state_ap'}
 
 
 def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=15, k_addr=15, k_joint=30,
-                        cap_name=20000, cap_addr=20000, resid_ks=(5, 5, 10), keep=(20, 5, 10), threads=2,
+                        cap_name=5000, cap_addr=5000, resid_ks=(5, 5, 10), keep=(20, 5, 10), threads=2,
                         verbose=True):
-    """Returns a polars frame (i1, i23, blk_name, blk_addr, blk_joint,
-    rk_joint, rk_name, rk_addr) with row indices into s1 / s23, the blocking
-    cosines and the per-S1 rank of the candidate under each cosine.
+    """Candidate generation for records of ONE country (callers loop over
+    countries so that only one country's records are in memory).
 
-    The raw union (~54/S1, 99.0% pair recall) is truncated to
-    joint-rank <= keep[0] OR name-rank <= keep[1] OR addr-rank <= keep[2]
-    (~24/S1, 98.5% recall on a 50k-S1 train sample)."""
-    out = []
+    s1 / s23 must carry BLOCK_COLS plus global row ids `_i1` / `_i23`.
+    Returns a polars frame (i1, i23, blk_name, blk_addr, blk_joint,
+    rk_joint, rk_name, rk_addr): global row indices, the blocking cosines and
+    the per-S1 rank of the candidate under each cosine.
+
+    Per geo block the raw top-k union is truncated to
+    joint-rank <= keep[0] OR name-rank <= keep[1] OR addr-rank <= keep[2],
+    and the same rule is re-applied to the union over blocks
+    (~24 candidates / S1, 98% pair recall on a 50k-S1 train sample)."""
     ks, caps = (k_name, k_addr, k_joint), (cap_name, cap_addr)
-    s1 = s1.select([c for c in BLOCK_COLS if c in s1.columns]).with_row_index('_i1')
-    s23 = s23.select([c for c in BLOCK_COLS if c in s23.columns]).with_row_index('_i23')
-    for country in sorted(set(s1['country'].unique().to_list())):
-        t0 = time.time()
-        a = s1.filter(pl.col('country') == country)
-        b = s23.filter(pl.col('country') == country)
-        if a.height == 0 or b.height == 0:
-            continue
-        X = tokenize_views(a, b)
-        ia = a['_i1'].to_numpy(); ib = b['_i23'].to_numpy()
-        # partition keys: S1 with several states is searched in each of them;
-        # S1 with no known state (e.g. France) is searched against the whole country
-        st1 = a['state'].to_list(); st2 = b['state'].to_list()
-        del a, b
-        groups1 = {}
-        for i, st in enumerate(st1):
-            for g in (set(STATE_ALIAS.get(x, x) for x in st.split()) or {''}):
-                groups1.setdefault(g, []).append(i)
-        g2 = np.array([STATE_ALIAS.get(x, x) if x and ' ' not in x else '' for x in st2])
-        resid = np.nonzero(g2 == '')[0]
-        order2 = np.argsort(g2, kind='stable'); sg2 = g2[order2]
-        parts = []
-        for g, rows in groups1.items():
-            rows1 = np.asarray(rows, dtype=np.int64)
-            if g == '':
-                rows23 = np.arange(len(g2), dtype=np.int64)
-                parts.append(search_block(X, rows1, rows23, ks, caps, threads))
-                continue
+    t0 = time.time()
+    country = s1['country'][0] if s1.height else ''
+    if s1.height == 0 or s23.height == 0:
+        return None
+    X = tokenize_views(s1, s23)
+    ia = s1['_i1'].to_numpy(); ib = s23['_i23'].to_numpy()
+    st1 = s1['state'].to_list(); st2 = s23['state'].to_list()
+    # partition keys: S1 with several states is searched in each of them;
+    # S1 with no known state (e.g. France) is searched against the whole country
+    groups1 = {}
+    for i, st in enumerate(st1):
+        for g in (set(STATE_ALIAS.get(x, x) for x in st.split()) or {''}):
+            groups1.setdefault(g, []).append(i)
+    g2 = np.array([STATE_ALIAS.get(x, x) if x and ' ' not in x else '' for x in st2])
+    resid = np.nonzero(g2 == '')[0]
+    order2 = np.argsort(g2, kind='stable'); sg2 = g2[order2]
+    parts = []
+    multi = np.array([len(set(x.split())) > 1 for x in st1])
+    for g, rows in groups1.items():
+        rows1 = np.asarray(rows, dtype=np.int64)
+        tb = time.time()
+        if g == '':
+            if len(rows1) > 0.5 * len(st1):
+                # country without canonical states (e.g. France): search everything
+                gp = [search_block(X, rows1, np.arange(len(g2), dtype=np.int64), ks, caps, threads, keep)]
+            else:
+                # a handful of stateless S1 in a stateful country: residual pool only
+                gp = [search_block(X, rows1, resid, ks, caps, threads, keep)]
+        else:
             lo, hi = np.searchsorted(sg2, g, 'left'), np.searchsorted(sg2, g, 'right')
-            tb = time.time()
-            parts.append(search_block(X, rows1, np.sort(order2[lo:hi]), ks, caps, threads))
-            parts.append(search_block(X, rows1, resid, resid_ks, caps, threads))
-            if verbose and len(rows1) > 20000:
-                print(f'    block {g}: {len(rows1)} x {hi - lo} (+{len(resid)} residual) {time.time() - tb:.0f}s',
-                      flush=True)
-        u = pl.concat([p for p in parts if p is not None]).unique(['r', 'c'])
-        u = u.select(pl.Series('i1', ia[u['r'].to_numpy()].astype(np.int32)),
-                     pl.Series('i23', ib[u['c'].to_numpy()].astype(np.int32)),
-                     'blk_name', 'blk_addr', ((pl.col('blk_name') + pl.col('blk_addr')) / 2).alias('blk_joint'))
-        u = u.with_columns([pl.col(f'blk_{v}').rank('ordinal', descending=True).over('i1').cast(pl.Int16)
-                            .alias(f'rk_{v}') for v in ('joint', 'name', 'addr')])
-        u = u.filter((pl.col('rk_joint') <= keep[0]) | (pl.col('rk_name') <= keep[1]) | (pl.col('rk_addr') <= keep[2]))
-        if verbose:
-            print(f'  blocking {country}: {len(ia)} x {len(ib)} -> {u.height} pairs '
-                  f'({u.height / len(ia):.1f}/S1), {len(groups1)} geo blocks, {time.time()-t0:.0f}s', flush=True)
-        out.append(u)
-        del X
-    return pl.concat(out)
+            gp = [search_block(X, rows1, np.sort(order2[lo:hi]), ks, caps, threads, keep),
+                  search_block(X, rows1, resid, resid_ks, caps, threads, keep)]
+        gp = [p for p in gp if p is not None]
+        if gp:   # union of the state block and the residual pool, truncated per S1 now (bounded memory)
+            parts.append(_truncate(pl.concat(gp), keep).select('r', 'c', 'blk_name', 'blk_addr'))
+        if verbose and len(rows1) > 20000:
+            print(f'    block {g}: {len(rows1)} S1 {time.time() - tb:.0f}s', flush=True)
+    del X
+    u = pl.concat(parts); del parts
+    # S1 rows searched in several state blocks: merge their lists
+    mrows = np.nonzero(multi)[0]
+    if len(mrows):
+        is_m = pl.col('r').is_in(pl.Series(mrows.astype(np.int32)).implode())
+        u = pl.concat([u.filter(~is_m), u.filter(is_m).unique(['r', 'c'])])
+    u = _truncate(u, keep)
+    u = u.select(pl.Series('i1', ia[u['r'].to_numpy()].astype(np.int32)),
+                 pl.Series('i23', ib[u['c'].to_numpy()].astype(np.int32)),
+                 'blk_name', 'blk_addr', 'blk_joint', 'rk_joint', 'rk_name', 'rk_addr')
+    if verbose:
+        print(f'  blocking {country}: {len(ia)} x {len(ib)} -> {u.height} pairs '
+              f'({u.height / len(ia):.1f}/S1), {len(groups1)} geo blocks, {time.time()-t0:.0f}s', flush=True)
+    return u

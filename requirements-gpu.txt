@@ -1,0 +1,4 @@
+# OPTIONAL: only for `python -m ber.embed` (multilingual name embeddings)
+-r requirements.txt
+torch>=2.2
+transformers>=4.40
