@@ -15,14 +15,13 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from .features import context_features
 from .io import write_id_lists
 from .postprocess import exclusive, select_expected_f, select_threshold
-from .train import featurise, load_records
+from .train import candidates_with_context, entity_ids, featurise
 
 
 def group_lists(sel: pl.DataFrame, e1, e23):
-    g = (sel.with_columns(pl.Series('m', e23[sel['i23'].to_numpy()]))
+    g = (sel.with_columns(e23.gather(sel['i23']).alias('m'))
          .sort('m').group_by('i1').agg(pl.col('m')))
     lists = [[] for _ in range(len(e1))]
     for i, m in zip(g['i1'].to_list(), g['m'].to_list()):
@@ -36,7 +35,7 @@ def main():
     ap.add_argument('--out', default='output')
     ap.add_argument('--split', default='test')
     ap.add_argument('--workers', type=int, default=os.cpu_count() or 2)
-    ap.add_argument('--chunk', type=int, default=2_000_000)
+    ap.add_argument('--chunk', type=int, default=3_000_000)
     a = ap.parse_args()
     t0 = time.time()
     os.makedirs(a.out, exist_ok=True)
@@ -49,19 +48,26 @@ def main():
         from .embed import load as load_emb
         emb = load_emb(a.art, a.split)
         assert emb is not None, 'model uses embeddings: run `python -m ber.embed --split test` first'
-    s1, s23 = load_records(a.art, a.split)
-    e1 = s1['entity_id'].to_numpy(); e23 = s23['entity_id'].to_numpy()
-    c = context_features(pl.read_parquet(f'{a.art}/cands_{a.split}.parquet'))
-    print(f'{c.height} candidate pairs for {len(e1)} S1', flush=True)
-    write_id_lists(f'{a.out}/candidate_pairs.tsv', e1, group_lists(c.select('i1', 'i23'), e1, e23),
-                   'candidate_entity_ids')
-
+    e1, e23 = entity_ids(a.art, a.split)
+    country = pl.read_parquet(f'{a.art}/{a.split}_s1.parquet', columns=['country'])['country']
+    cand_lists = []
     scored = []
-    for i in range(0, c.height, a.chunk):
-        part = featurise(c.slice(i, a.chunk), s1, s23, a.workers, log=False, emb=emb)
-        p = model.predict(part.select(feats).to_numpy(), num_threads=a.workers).astype(np.float32)
-        scored.append(part.select('i1', 'i23').with_columns(pl.Series('prob', p)))
-        print(f'  scored {min(i + a.chunk, c.height)}/{c.height} ({time.time() - t0:.0f}s)', flush=True)
+    for cn in sorted(country.unique().to_list()):
+        # countries are disjoint in both S1 and S2/S3, so per-country context is exact
+        keep = np.nonzero((country == cn).to_numpy())[0]
+        c = candidates_with_context(a.art, a.split, keep)
+        print(f'[{cn}] {c.height} candidate pairs for {len(keep)} S1 ({time.time() - t0:.0f}s)', flush=True)
+        cand_lists.append(c.select('i1', 'i23'))
+        for i in range(0, c.height, a.chunk):
+            meta, X, names = featurise(c.slice(i, a.chunk), a.art, a.split, a.workers, log=False, emb=emb)
+            assert names == feats, 'feature mismatch between training and inference'
+            p = model.predict(X, num_threads=a.workers).astype(np.float32)
+            scored.append(meta.select('i1', 'i23').with_columns(pl.Series('prob', p)))
+            del meta, X
+            print(f'  scored {min(i + a.chunk, c.height)}/{c.height} ({time.time() - t0:.0f}s)', flush=True)
+        del c
+    write_id_lists(f'{a.out}/candidate_pairs.tsv', e1, group_lists(pl.concat(cand_lists), e1, e23),
+                   'candidate_entity_ids')
     scored = pl.concat(scored)
     scored.write_parquet(f'{a.art}/scored_{a.split}.parquet')
 

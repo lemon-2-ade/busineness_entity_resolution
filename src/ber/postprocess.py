@@ -48,12 +48,12 @@ def select_expected_f(scored: pl.DataFrame, prob='prob', miss_prior=0.05, min_pr
     return keep.select('i1', 'i23')
 
 
-def to_lists(sel: pl.DataFrame, s1_ids: np.ndarray, s23_ids: np.ndarray) -> dict:
+def to_lists(sel: pl.DataFrame, s1_ids: pl.Series, s23_ids: pl.Series) -> dict:
     """{s1_entity_id: set(matched ids)}"""
     out = {}
     if sel.height == 0:
         return out
-    a = s1_ids[sel['i1'].to_numpy()]; b = s23_ids[sel['i23'].to_numpy()]
+    a = s1_ids.gather(sel['i1']).to_list(); b = s23_ids.gather(sel['i23']).to_list()
     for x, y in zip(a, b):
         out.setdefault(x, set()).add(y)
     return out

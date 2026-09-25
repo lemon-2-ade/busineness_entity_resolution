@@ -17,7 +17,7 @@ from rapidfuzz.distance import JaroWinkler, Levenshtein
 from rapidfuzz.process import cpdist
 
 REC_COLS = ['entity_id', 'rflags', 'name_norm', 'name_core', 'name_alt', 'name_compact', 'legal', 'nflags',
-            'addr_norm', 'addr_core', 'addr_nums', 'state']
+            'addr_core', 'addr_nums', 'state']
 
 _VOWELS = re.compile(r'[aeiouyh\s]')
 _REPEAT = re.compile(r'(.)\1+')
@@ -163,27 +163,50 @@ def pair_features(p: pl.DataFrame, s1: pl.DataFrame, s23: pl.DataFrame, workers=
     return p.with_columns([pl.Series(k, v.astype(np.float32)) for k, v in f.items()])
 
 
-def context_features(c: pl.DataFrame, score='blk_joint', prefix='cx') -> pl.DataFrame:
-    """Competition features computed on the *full* candidate graph of a split
-    (all S1 entities), so they mean the same thing at train and test time.
+def _group_stats(key, score):
+    """For each row: group size, rank of score within its key-group (1 = best),
+    best score of the group, second-best score (0 if none).  Pure numpy with a
+    single lexsort, so it scales to 50M+ rows in bounded memory."""
+    order = np.lexsort((-score, key))
+    k = key[order]; sc = score[order]
+    start = np.r_[0, np.nonzero(k[1:] != k[:-1])[0] + 1]
+    size = np.diff(np.r_[start, len(k)])
+    gid = np.repeat(np.arange(len(start)), size)
+    rank = np.arange(len(k)) - start[gid] + 1
+    best = sc[start]
+    second = np.where(size > 1, sc[np.minimum(start + 1, len(k) - 1)], 0).astype(np.float32)
+    out_size = np.empty(len(k), np.float32); out_rank = np.empty(len(k), np.float32)
+    out_best = np.empty(len(k), np.float32); out_second = np.empty(len(k), np.float32)
+    out_size[order] = size[gid]; out_rank[order] = rank
+    out_best[order] = best[gid]; out_second[order] = second[gid]
+    return out_size, out_rank, out_best, out_second
 
-    S1 side : #candidates, best score, gap to best, score / best, rank.
+
+def context_features(i1, i23, score, keep_mask=None, prefix='cx') -> pl.DataFrame:
+    """Competition features computed on the *full* candidate graph, so they
+    mean the same thing at train and test time.
+
+    i1, i23, score : arrays over all candidate rows that compete for the
+                     S2/S3 records of interest (the whole graph, or a subset
+                     closed under "same i23")
+    keep_mask      : rows to return (all candidates of the S1 entities of
+                     interest); default all.
+
+    S1 side : #candidates, gap to the best score, score / best.
     S23 side: #S1 entities that retrieved this record, rank of this S1 among
-              them, gap to the best competing S1, and the 2nd-best score.
+              them, gap to the best competing S1 and margin over the best
+              *other* S1 (positive only for the top-ranked S1).
     """
-    s = pl.col(score)
-    c = c.with_columns(
-        pl.len().over('i1').cast(pl.Float32).alias(f'{prefix}_n1'),
-        (s.max().over('i1') - s).alias(f'{prefix}_gap1'),
-        (s / (s.max().over('i1') + 1e-6)).alias(f'{prefix}_rel1'),
-        pl.len().over('i23').cast(pl.Float32).alias(f'{prefix}_n23'),
-        s.rank('ordinal', descending=True).over('i23').cast(pl.Float32).alias(f'{prefix}_rk23'),
-        (s.max().over('i23') - s).alias(f'{prefix}_gap23'),
-    )
-    # margin of this S1 over the best *other* S1 competing for the same record
-    second = s.filter(pl.col(f'{prefix}_rk23') > 1).max().over('i23').fill_null(0)
-    c = c.with_columns(
-        pl.when(pl.col(f'{prefix}_rk23') == 1).then(s - second)
-        .otherwise(-pl.col(f'{prefix}_gap23')).alias(f'{prefix}_margin23')
-    )
-    return c
+    score = score.astype(np.float32)
+    n23, rk23, best23, second23 = _group_stats(i23, score)
+    if keep_mask is not None:
+        i1, i23, score = i1[keep_mask], i23[keep_mask], score[keep_mask]
+        n23, rk23, best23, second23 = n23[keep_mask], rk23[keep_mask], best23[keep_mask], second23[keep_mask]
+    n1, _, best1, _ = _group_stats(i1, score)
+    gap23 = best23 - score
+    margin23 = np.where(rk23 == 1, score - second23, -gap23)
+    return pl.DataFrame({
+        'i1': i1, 'i23': i23, 'blk_joint': score,
+        f'{prefix}_n1': n1, f'{prefix}_gap1': best1 - score, f'{prefix}_rel1': score / (best1 + 1e-6),
+        f'{prefix}_n23': n23, f'{prefix}_rk23': rk23, f'{prefix}_gap23': gap23, f'{prefix}_margin23': margin23,
+    })
