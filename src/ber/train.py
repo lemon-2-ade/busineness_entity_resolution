@@ -201,7 +201,12 @@ def tune_postprocessing(cva, truth, e1, e23, va_s1):
     print('reference: thr 0.5 without exclusivity', round(breakdown(pred, truth, va_s1)['macro_f05'], 4))
     for r in results:
         print(r[0], r[1], {k: round(v, 4) if isinstance(v, float) else v for k, v in r[2].items()})
-    return max(results, key=lambda r: r[2]['macro_f05'])
+    best = max(results, key=lambda r: r[2]['macro_f05'])
+    # Prefer the plain threshold when it is within noise (0.0005) of the best rule:
+    # it is simpler and more conservative on singletons, which matters under the
+    # unseen-country (France) shift where calibration may degrade.
+    thr = max((r for r in results if r[0] == 'thr'), key=lambda r: r[2]['macro_f05'])
+    return thr if best[2]['macro_f05'] - thr[2]['macro_f05'] <= 5e-4 else best
 
 
 LGB_PARAMS = dict(objective='binary', learning_rate=0.05, num_leaves=127, min_data_in_leaf=100,

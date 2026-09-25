@@ -30,27 +30,7 @@ def group_lists(sel: pl.DataFrame, e1, e23):
     return lists
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--art', default='artifacts')
-    ap.add_argument('--out', default='output')
-    ap.add_argument('--split', default='test')
-    ap.add_argument('--workers', type=int, default=os.cpu_count() or 2)
-    ap.add_argument('--chunk', type=int, default=3_000_000)
-    a = ap.parse_args()
-    t0 = time.time()
-    os.makedirs(a.out, exist_ok=True)
-    cfg = json.load(open(f'{a.art}/model/config.json'))
-    feats = cfg['features']
-    model = lgb.Booster(model_file=f'{a.art}/model/lgb.txt')
-    model2 = lgb.Booster(model_file=f'{a.art}/model/lgb_stage2.txt') if cfg.get('stage2') else None
-
-    emb = None
-    if 'emb_name_cos' in feats:
-        from .embed import load as load_emb
-        emb = load_emb(a.art, a.split)
-        assert emb is not None, 'model uses embeddings: run `python -m ber.embed --split test` first'
-    e1, e23 = entity_ids(a.art, a.split)
+def score_all(a, cfg, feats, model, model2, emb, e1, e23, t0):
     country = pl.read_parquet(f'{a.art}/{a.split}_s1.parquet', columns=['country'])['country']
     cand_lists = []
     scored = []
@@ -62,8 +42,8 @@ def main():
         cand_lists.append(c.select('i1', 'i23'))
         metas, ps = [], []
         mm = None
-        if model2 is not None:   # stage-1 features are spilled to disk for the stage-2 pass
-            mm = np.lib.format.open_memmap(f'{a.art}/_stage1_X.npy', mode='w+', dtype=np.float16,
+        if model2 is not None:   # stage-1 features (float32, as in training) are spilled to disk for stage 2
+            mm = np.lib.format.open_memmap(f'{a.art}/_stage1_X.npy', mode='w+', dtype=np.float32,
                                            shape=(c.height, len(feats)))
         for i in range(0, c.height, a.chunk):
             meta, X, names = featurise(c.slice(i, a.chunk), a.art, a.split, a.workers, log=False, emb=emb)
@@ -92,6 +72,37 @@ def main():
                    'candidate_entity_ids')
     scored = pl.concat(scored)
     scored.write_parquet(f'{a.art}/scored_{a.split}.parquet')
+
+    return scored
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--art', default='artifacts')
+    ap.add_argument('--out', default='output')
+    ap.add_argument('--split', default='test')
+    ap.add_argument('--workers', type=int, default=os.cpu_count() or 2)
+    ap.add_argument('--chunk', type=int, default=3_000_000)
+    ap.add_argument('--post-only', action='store_true',
+                    help='re-run only the selection step from artifacts/scored_<split>.parquet')
+    a = ap.parse_args()
+    t0 = time.time()
+    os.makedirs(a.out, exist_ok=True)
+    cfg = json.load(open(f'{a.art}/model/config.json'))
+    feats = cfg['features']
+    model = lgb.Booster(model_file=f'{a.art}/model/lgb.txt')
+    model2 = lgb.Booster(model_file=f'{a.art}/model/lgb_stage2.txt') if cfg.get('stage2') else None
+
+    emb = None
+    if 'emb_name_cos' in feats:
+        from .embed import load as load_emb
+        emb = load_emb(a.art, a.split)
+        assert emb is not None, 'model uses embeddings: run `python -m ber.embed --split test` first'
+    e1, e23 = entity_ids(a.art, a.split)
+    if a.post_only:
+        scored = pl.read_parquet(f'{a.art}/scored_{a.split}.parquet')
+    else:
+        scored = score_all(a, cfg, feats, model, model2, emb, e1, e23, t0)
 
     ex = exclusive(scored)
     method, param = cfg['post']['method'], cfg['post']['param']
