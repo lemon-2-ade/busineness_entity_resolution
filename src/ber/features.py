@@ -17,7 +17,7 @@ from rapidfuzz.distance import JaroWinkler, Levenshtein
 from rapidfuzz.process import cpdist
 
 REC_COLS = ['entity_id', 'rflags', 'name_norm', 'name_core', 'name_alt', 'name_compact', 'legal', 'nflags',
-            'addr_core', 'addr_nums']
+            'addr_core', 'addr_nums', 'name_freq']
 
 _VOWELS = re.compile(r'[aeiouyh\s]')
 _REPEAT = re.compile(r'(.)\1+')

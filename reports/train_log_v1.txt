@@ -1,0 +1,69 @@
+valid: 132409 S1 in 24 held-out states ['India|state_cg', 'India|state_co', 'India|state_ct', 'India|state_dc', 'India|state_fl', 'India|state_ga', 'India|state_gj', 'India|state_ia', 'India|state_jh', 'India|state_jk', 'India|state_ky', 'India|state_ma', 'India|state_me', 'India|state_mn', 'India|state_nd', 'India|state_ne', 'India|state_nh', 'India|state_ny', 'India|state_od', 'India|state_or', 'India|state_ri', 'US|state_id', 'US|state_nh', 'US|state_tn']
+9341245 candidates; pair recall ceiling 0.9833
+train pairs 6086883 (pos 849938), valid pairs 3254362
+    features 1000000/6086883 30s
+    features 2000000/6086883 59s
+    features 3000000/6086883 84s
+    features 4000000/6086883 108s
+    features 5000000/6086883 132s
+    features 6000000/6086883 156s
+    features 6086883/6086883 160s
+65 features: ['blk_joint', 'cx_n1', 'cx_gap1', 'cx_rel1', 'cx_n23', 'cx_rk23', 'cx_gap23', 'cx_margin23', 'blk_name', 'blk_addr', 'rk_joint', 'rk_name', 'rk_addr', 'nm_ratio', 'nm_tsort', 'nm_tset', 'nm_partial', 'nm_core_ratio', 'nm_compact_ratio', 'nm_compact_jw', 'nm_compact_partial', 'nm_lev', 'nm_alt_tset', 'nm_best_tset', 'nm_skel_ratio', 'nm_skel_partial', 'nm_jac', 'nm_inter', 'nm_cov1', 'nm_cov2', 'nm_len1', 'nm_len2', 'nm_ntok2', 'nm_first_eq', 'nm_prefix4', 'lg_both', 'lg_agree', 'lg_conflict', 'nm2_domain', 'nm2_alias', 'nm2_native', 'nm2_upper', 'ad_empty2', 'ad_ratio', 'ad_tsort', 'ad_tset', 'ad_partial', 'ad_jac', 'ad_inter', 'ad_cov1', 'ad_cov2', 'ad_ntok1', 'ad_ntok2', 'ad_words_tset', 'num_any', 'num_first_eq', 'num_jac', 'num_sub', 'num_conflict', 'num_both', 'num_maxlen', 'st_eq', 'st_missing2', 'src3', 'nm_x_ad']
+    features 1000000/3254362 30s
+    features 2000000/3254362 55s
+    features 3000000/3254362 79s
+    features 3254362/3254362 85s
+Training until validation scores don't improve for 100 rounds
+[100]	valid's binary_logloss: 0.0232065
+[200]	valid's binary_logloss: 0.0193849
+[300]	valid's binary_logloss: 0.0185068
+[400]	valid's binary_logloss: 0.0181796
+[500]	valid's binary_logloss: 0.0180023
+[600]	valid's binary_logloss: 0.0178692
+[700]	valid's binary_logloss: 0.0177262
+[800]	valid's binary_logloss: 0.0176346
+[900]	valid's binary_logloss: 0.0175353
+[1000]	valid's binary_logloss: 0.0174563
+[1100]	valid's binary_logloss: 0.0174047
+[1200]	valid's binary_logloss: 0.0173763
+[1300]	valid's binary_logloss: 0.017343
+[1400]	valid's binary_logloss: 0.0173053
+[1500]	valid's binary_logloss: 0.0172671
+[1600]	valid's binary_logloss: 0.0172461
+[1700]	valid's binary_logloss: 0.0172229
+[1800]	valid's binary_logloss: 0.0171941
+[1900]	valid's binary_logloss: 0.0171746
+[2000]	valid's binary_logloss: 0.0171636
+[2100]	valid's binary_logloss: 0.0171508
+Early stopping, best iteration is:
+[2096]	valid's binary_logloss: 0.0171503
+feature importance (gain): [('cx_margin23', 24500051), ('cx_rk23', 5676648), ('num_conflict', 1550029), ('nm_ratio', 1129408), ('num_jac', 1009062), ('cx_gap23', 818855), ('num_sub', 531116), ('ad_tset', 465475), ('ad_cov2', 276223), ('nm_cov2', 214217), ('lg_conflict', 205756), ('nm_x_ad', 200866), ('ad_tsort', 195971), ('nm_ntok2', 167500), ('nm_lev', 162007), ('num_both', 139262), ('ad_ntok1', 123382), ('blk_name', 120166), ('cx_n23', 94361), ('rk_joint', 94359), ('nm_first_eq', 90187), ('blk_joint', 84724), ('ad_ntok2', 81920), ('nm_compact_jw', 80965), ('ad_words_tset', 74610), ('nm_len2', 70710), ('nm2_native', 69088), ('nm_compact_partial', 67821), ('ad_ratio', 64613), ('nm_core_ratio', 63642), ('cx_rel1', 61001), ('rk_addr', 60195), ('cx_gap1', 59675), ('nm_len1', 58169), ('nm_jac', 56246), ('nm2_domain', 53748), ('blk_addr', 53422), ('cx_n1', 52952), ('nm_tsort', 52840), ('ad_jac', 52615), ('lg_both', 52520), ('rk_name', 52404), ('nm_tset', 48077), ('nm_best_tset', 44677), ('nm_compact_ratio', 43190), ('nm_skel_ratio', 42034), ('num_first_eq', 40864), ('lg_agree', 40778), ('ad_cov1', 39830), ('ad_empty2', 39664), ('num_maxlen', 36592), ('num_any', 35315), ('ad_inter', 33139), ('nm_partial', 31221), ('nm_cov1', 31083), ('nm_inter', 21910), ('nm_skel_partial', 20817), ('nm_prefix4', 18913), ('src3', 9824), ('nm2_upper', 4888), ('ad_partial', 1750), ('st_eq', 627), ('st_missing2', 623), ('nm_alt_tset', 581), ('nm2_alias', 243)]
+reference: thr 0.5 without exclusivity 0.9725
+thr 0.3 {'macro_f05': 0.9636, 'singleton_f05': 0.8879, 'n_singleton': 7565, 'nonsingleton_f05': 0.9682, 'n_nonsingleton': 124844, 'micro_precision': 0.9711, 'micro_recall': 0.9644}
+thr 0.35 {'macro_f05': 0.9668, 'singleton_f05': 0.9054, 'n_singleton': 7565, 'nonsingleton_f05': 0.9705, 'n_nonsingleton': 124844, 'micro_precision': 0.9759, 'micro_recall': 0.9619}
+thr 0.4 {'macro_f05': 0.9692, 'singleton_f05': 0.9199, 'n_singleton': 7565, 'nonsingleton_f05': 0.9722, 'n_nonsingleton': 124844, 'micro_precision': 0.9798, 'micro_recall': 0.9593}
+thr 0.45 {'macro_f05': 0.9712, 'singleton_f05': 0.9348, 'n_singleton': 7565, 'nonsingleton_f05': 0.9734, 'n_nonsingleton': 124844, 'micro_precision': 0.983, 'micro_recall': 0.9567}
+thr 0.5 {'macro_f05': 0.9729, 'singleton_f05': 0.9467, 'n_singleton': 7565, 'nonsingleton_f05': 0.9744, 'n_nonsingleton': 124844, 'micro_precision': 0.986, 'micro_recall': 0.9541}
+thr 0.55 {'macro_f05': 0.9739, 'singleton_f05': 0.9556, 'n_singleton': 7565, 'nonsingleton_f05': 0.975, 'n_nonsingleton': 124844, 'micro_precision': 0.9883, 'micro_recall': 0.9512}
+thr 0.6 {'macro_f05': 0.9747, 'singleton_f05': 0.9629, 'n_singleton': 7565, 'nonsingleton_f05': 0.9755, 'n_nonsingleton': 124844, 'micro_precision': 0.9904, 'micro_recall': 0.9486}
+thr 0.65 {'macro_f05': 0.9749, 'singleton_f05': 0.9679, 'n_singleton': 7565, 'nonsingleton_f05': 0.9753, 'n_nonsingleton': 124844, 'micro_precision': 0.9919, 'micro_recall': 0.9459}
+thr 0.7 {'macro_f05': 0.975, 'singleton_f05': 0.9725, 'n_singleton': 7565, 'nonsingleton_f05': 0.9751, 'n_nonsingleton': 124844, 'micro_precision': 0.9933, 'micro_recall': 0.9432}
+thr 0.75 {'macro_f05': 0.9748, 'singleton_f05': 0.9782, 'n_singleton': 7565, 'nonsingleton_f05': 0.9746, 'n_nonsingleton': 124844, 'micro_precision': 0.9944, 'micro_recall': 0.9403}
+thr 0.8 {'macro_f05': 0.9742, 'singleton_f05': 0.9822, 'n_singleton': 7565, 'nonsingleton_f05': 0.9738, 'n_nonsingleton': 124844, 'micro_precision': 0.9953, 'micro_recall': 0.9366}
+thr 0.85 {'macro_f05': 0.9732, 'singleton_f05': 0.987, 'n_singleton': 7565, 'nonsingleton_f05': 0.9723, 'n_nonsingleton': 124844, 'micro_precision': 0.9963, 'micro_recall': 0.9315}
+thr 0.9 {'macro_f05': 0.9708, 'singleton_f05': 0.9913, 'n_singleton': 7565, 'nonsingleton_f05': 0.9696, 'n_nonsingleton': 124844, 'micro_precision': 0.9974, 'micro_recall': 0.9237}
+thr 0.95 {'macro_f05': 0.9648, 'singleton_f05': 0.9956, 'n_singleton': 7565, 'nonsingleton_f05': 0.9629, 'n_nonsingleton': 124844, 'micro_precision': 0.9985, 'micro_recall': 0.907}
+ef (0.0, 0.1) {'macro_f05': 0.9744, 'singleton_f05': 0.9338, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9934, 'micro_recall': 0.9419}
+ef (0.0, 0.25) {'macro_f05': 0.9744, 'singleton_f05': 0.9338, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9934, 'micro_recall': 0.9419}
+ef (0.0, 0.4) {'macro_f05': 0.9744, 'singleton_f05': 0.9346, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9935, 'micro_recall': 0.9419}
+ef (0.0, 0.5) {'macro_f05': 0.9749, 'singleton_f05': 0.9467, 'n_singleton': 7565, 'nonsingleton_f05': 0.9766, 'n_nonsingleton': 124844, 'micro_precision': 0.9937, 'micro_recall': 0.9418}
+ef (0.1, 0.1) {'macro_f05': 0.9745, 'singleton_f05': 0.9352, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9933, 'micro_recall': 0.9422}
+ef (0.1, 0.25) {'macro_f05': 0.9745, 'singleton_f05': 0.9352, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9933, 'micro_recall': 0.9422}
+ef (0.1, 0.4) {'macro_f05': 0.9745, 'singleton_f05': 0.9359, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9934, 'micro_recall': 0.9422}
+ef (0.1, 0.5) {'macro_f05': 0.9749, 'singleton_f05': 0.9467, 'n_singleton': 7565, 'nonsingleton_f05': 0.9766, 'n_nonsingleton': 124844, 'micro_precision': 0.9936, 'micro_recall': 0.9421}
+ef (0.3, 0.1) {'macro_f05': 0.9746, 'singleton_f05': 0.9375, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9932, 'micro_recall': 0.9428}
+ef (0.3, 0.25) {'macro_f05': 0.9746, 'singleton_f05': 0.9375, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9932, 'micro_recall': 0.9428}
+ef (0.3, 0.4) {'macro_f05': 0.9746, 'singleton_f05': 0.9381, 'n_singleton': 7565, 'nonsingleton_f05': 0.9768, 'n_nonsingleton': 124844, 'micro_precision': 0.9932, 'micro_recall': 0.9428}
+ef (0.3, 0.5) {'macro_f05': 0.975, 'singleton_f05': 0.9467, 'n_singleton': 7565, 'nonsingleton_f05': 0.9767, 'n_nonsingleton': 124844, 'micro_precision': 0.9934, 'micro_recall': 0.9427}
+BEST ('thr', 0.7, {'macro_f05': 0.9749921999667027, 'singleton_f05': 0.9725049570389954, 'n_singleton': 7565, 'nonsingleton_f05': 0.9751429160023072, 'n_nonsingleton': 124844, 'micro_precision': 0.9932818536374227, 'micro_recall': 0.9431563299302625})
+done in 2428s

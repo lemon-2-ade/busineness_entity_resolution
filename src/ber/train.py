@@ -59,7 +59,7 @@ class RecordStore:
 
     def __init__(self, art, split, sources):
         self.frames, self.offsets = [], [0]
-        cols = [x for x in REC_COLS if x != 'rflags'] + ['business_name']
+        cols = [x for x in REC_COLS if x not in ('rflags', 'name_freq')] + ['business_name']
         for src in sources:
             path = f'{art}/{split}_s{src}.rec.arrow'
             if not os.path.exists(path):
@@ -212,9 +212,17 @@ STAGE2_PARAMS = dict(objective='binary', learning_rate=0.05, num_leaves=63, min_
                      max_bin=255, verbose=-1)
 
 
+def binned(X, y, names, workers, seed, params=None):
+    """Construct the LightGBM training Dataset right away so the float matrix
+    can be freed (the binned copy is ~4x smaller)."""
+    p = dict(params or LGB_PARAMS, num_threads=workers, seed=seed)
+    return lgb.Dataset(X, y, feature_name=names, free_raw_data=True, params=p).construct()
+
+
 def fit(params, X, y, Xv, yv, names, workers, seed):
+    """X may be a raw matrix or an already constructed lgb.Dataset."""
     p = dict(params, num_threads=workers, seed=seed)
-    dtr = lgb.Dataset(X, y, feature_name=names, free_raw_data=True)
+    dtr = X if isinstance(X, lgb.Dataset) else lgb.Dataset(X, y, feature_name=names, free_raw_data=True)
     dva = lgb.Dataset(Xv, yv, reference=dtr)
     return lgb.train(p, dtr, num_boost_round=4000, valid_sets=[dva], valid_names=['valid'],
                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)])
@@ -266,17 +274,18 @@ def main():
     mtr, Xtr, feats = featurise(ctr, a.art, 'train', a.workers, emb=emb)
     ytr = mtr['y'].to_numpy()
     print(f'{len(feats)} features: {feats}', flush=True)
-    del ctr, mtr; gc.collect()
+    dtr = binned(Xtr, ytr, feats, a.workers, a.seed)
+    del ctr, mtr, Xtr; gc.collect()
     mva, Xva, _ = featurise(cva, a.art, 'train', a.workers, emb=emb)
     del cva
     # stage 1 early-stops on the stage-2 fold when it exists (keeps the validation fold untouched)
     if use2:
         ms2, Xs2, _ = featurise(cs2, a.art, 'train', a.workers, emb=emb)
         del cs2
-        m1 = fit(LGB_PARAMS, Xtr, ytr, Xs2, ms2['y'].to_numpy(), feats, a.workers, a.seed)
+        m1 = fit(LGB_PARAMS, dtr, ytr, Xs2, ms2['y'].to_numpy(), feats, a.workers, a.seed)
     else:
-        m1 = fit(LGB_PARAMS, Xtr, ytr, Xva, mva['y'].to_numpy(), feats, a.workers, a.seed)
-    del Xtr, ytr; gc.collect()
+        m1 = fit(LGB_PARAMS, dtr, ytr, Xva, mva['y'].to_numpy(), feats, a.workers, a.seed)
+    del dtr, ytr; gc.collect()
     os.makedirs(f'{a.art}/model', exist_ok=True)
     m1.save_model(f'{a.art}/model/lgb.txt')
     imp = sorted(zip(feats, m1.feature_importance('gain')), key=lambda x: -x[1])
@@ -299,7 +308,9 @@ def main():
         # fold's S1 entities, so the validation fold stays untouched.
         es = (ms2['i1'].to_numpy() % 5) == 0
         y2 = ms2['y'].to_numpy()
-        m2 = fit(STAGE2_PARAMS, X2[~es], y2[~es], X2[es], y2[es], feats + names2, a.workers, a.seed)
+        d2 = binned(X2[~es], y2[~es], feats + names2, a.workers, a.seed, STAGE2_PARAMS)
+        X2es = X2[es]; del X2; gc.collect()
+        m2 = fit(STAGE2_PARAMS, d2, None, X2es, y2[es], feats + names2, a.workers, a.seed)
         m2.save_model(f'{a.art}/model/lgb_stage2.txt')
         imp2 = sorted(zip(feats + names2, m2.feature_importance('gain')), key=lambda x: -x[1])
         print('stage-2 feature importance (gain):', [(f, round(g)) for f, g in imp2[:20]], flush=True)
