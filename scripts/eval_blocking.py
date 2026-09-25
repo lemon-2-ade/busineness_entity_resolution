@@ -7,14 +7,15 @@ from ber.blocking import generate_candidates
 from ber.io import read_ground_truth
 
 ap = argparse.ArgumentParser(); ap.add_argument('--n', type=int, default=50000); ap.add_argument('--art', default='artifacts')
-ap.add_argument('--kn', type=int, default=15); ap.add_argument('--ka', type=int, default=15); ap.add_argument('--kj', type=int, default=25)
+ap.add_argument('--kn', type=int, default=20); ap.add_argument('--ka', type=int, default=20)
 ap.add_argument('--maxc', type=int, default=30)
 a = ap.parse_args()
-s1 = pl.read_parquet(f'{a.art}/train_s1.parquet').sample(a.n, seed=0)
-s23 = pl.concat([pl.read_parquet(f'{a.art}/train_s2.parquet'), pl.read_parquet(f'{a.art}/train_s3.parquet')])
+from ber.blocking import BLOCK_COLS
+s1 = pl.read_parquet(f'{a.art}/train_s1.parquet', columns=BLOCK_COLS).sample(a.n, seed=0)
+s23 = pl.concat([pl.read_parquet(f'{a.art}/train_s{i}.parquet', columns=BLOCK_COLS) for i in (2, 3)])
 _, pairs = read_ground_truth('data/train/train_ground_truth.tsv')
 t = time.time()
-c = generate_candidates(s1, s23, a.kn, a.ka, a.kj, a.maxc)
+c = generate_candidates(s1, s23, a.kn, a.ka, a.maxc)
 print('time', time.time() - t)
 c = c.with_columns(pl.Series('s1', s1['entity_id'].to_numpy()[c['i1'].to_numpy()]), pl.Series('s23', s23['entity_id'].to_numpy()[c['i23'].to_numpy()]))
 tp = pairs.filter(pl.col('source1_entity_id').is_in(s1['entity_id'].implode()))

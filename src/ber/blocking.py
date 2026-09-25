@@ -9,11 +9,10 @@ is used as an opaque string, so France is handled like any other value):
                    (typo / word-split / domain-name robust)
   * ADDRESS view - address core tokens + adjacent token bigrams
                    (catches pure-alias names such as "Lumquo" at the S1 address)
-  * JOINT view   - the two views concatenated (best single ranking)
 
-The per-view top-k lists are unioned; each candidate keeps its three blocking
-cosines, which become features for the matcher.  The union is then
-truncated by the joint score to at most `max_cands` per S1 entity.
+The per-view top-k lists are unioned; each candidate keeps both blocking
+cosines (features for the matcher).  The union is ranked by the mean of the
+two cosines ("joint") and truncated to at most `max_cands` per S1 entity.
 """
 from __future__ import annotations
 
@@ -77,31 +76,28 @@ def _tfidf(indptr, indices, ncols, idf):
     return sp.diags((1 / norms).astype(np.float32)) @ m
 
 
-def build_views(s1: pl.DataFrame, s23: pl.DataFrame, max_df_frac=0.02):
-    """Returns dict view -> (A (n1 x V), B (n23 x V)) tf-idf matrices.
+def build_view(s1: pl.DataFrame, s23: pl.DataFrame, view: str, max_df_frac=0.02):
+    """Returns (A (n1 x V), B (n23 x V)) L2-normalised tf-idf matrices for one view.
     IDF is computed on the target side (S2+S3); very common tokens
     (df > max_df_frac * n23) are dropped from blocking - they carry little
     identity signal and dominate the cost of the sparse product."""
-    views = {}
-    specs = {
-        'name': lambda df: [name_tokens(a, b, c) for a, b, c in
-                            zip(df['name_core'], df['name_alt'], df['name_compact'])],
-        'addr': lambda df: [addr_tokens(a) for a in df['addr_core']],
-    }
-    for v, fn in specs.items():
-        voc = Vocab()
-        ip2, ix2 = voc.matrix(fn(s23))
-        ip1, ix1 = voc.matrix(fn(s1))
-        V = len(voc.idx); n23 = len(ip2) - 1
-        df_ = np.bincount(np.frombuffer(ix2, dtype=np.int32), minlength=V).astype(np.float64)
-        idf = np.log((n23 + 1) / (df_ + 1)) + 1
-        idf[df_ > max_df_frac * n23] = 0.0          # prune stop-tokens
-        idf[df_ == 0] = 0.0                         # tokens absent from target side
-        views[v] = (_tfidf(ip1, ix1, V, idf), _tfidf(ip2, ix2, V, idf))
-    A = sp.hstack([views['name'][0], views['addr'][0]], format='csr') * (1 / math.sqrt(2))
-    B = sp.hstack([views['name'][1], views['addr'][1]], format='csr') * (1 / math.sqrt(2))
-    views['joint'] = (A, B)
-    return views
+    if view == 'name':
+        fn = lambda df: (name_tokens(a, b, c) for a, b, c in zip(df['name_core'], df['name_alt'], df['name_compact']))
+    else:
+        fn = lambda df: (addr_tokens(a) for a in df['addr_core'])
+    voc = Vocab()
+    ip2, ix2 = voc.matrix(fn(s23))
+    ip1, ix1 = voc.matrix(fn(s1))
+    V = len(voc.idx); n23 = len(ip2) - 1
+    del voc
+    df_ = np.bincount(np.frombuffer(ix2, dtype=np.int32), minlength=V).astype(np.float64)
+    idf = np.log((n23 + 1) / (df_ + 1)) + 1
+    idf[df_ > max_df_frac * n23] = 0.0          # prune stop-tokens
+    idf[df_ == 0] = 0.0                         # tokens absent from target side
+    A = _tfidf(ip1, ix1, V, idf); del ip1, ix1
+    B = _tfidf(ip2, ix2, V, idf); del ip2, ix2
+    A.eliminate_zeros(); B.eliminate_zeros()
+    return A, B
 
 
 def _topn(A, B, k, threads, chunk=20000):
@@ -117,29 +113,34 @@ def _topn(A, B, k, threads, chunk=20000):
     return np.concatenate(rs), np.concatenate(cs), np.concatenate(vs)
 
 
-def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=15, k_addr=15, k_joint=25, max_cands=30,
+BLOCK_COLS = ['entity_id', 'country', 'name_core', 'name_alt', 'name_compact', 'addr_core']
+
+
+def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=20, k_addr=20, max_cands=30,
                         threads=2, verbose=True):
     """Returns a polars frame (i1, i23, blk_name, blk_addr, blk_joint) with row
-    indices into s1 / s23 plus the three blocking cosines."""
+    indices into s1 / s23 plus the blocking cosines.  blk_joint is the mean of
+    the name and address cosines and is used to rank / truncate the union."""
     out = []
-    s1 = s1.with_row_index('_i1'); s23 = s23.with_row_index('_i23')
+    s1 = s1.select([c for c in BLOCK_COLS if c in s1.columns]).with_row_index('_i1')
+    s23 = s23.select([c for c in BLOCK_COLS if c in s23.columns]).with_row_index('_i23')
     for country in sorted(set(s1['country'].unique().to_list())):
         a = s1.filter(pl.col('country') == country)
         b = s23.filter(pl.col('country') == country)
         if a.height == 0 or b.height == 0:
             continue
-        views = build_views(a, b)
-        res = {}
-        for v, k in (('name', k_name), ('addr', k_addr), ('joint', k_joint)):
-            A, B = views[v]
-            r, c, val = _topn(A, B, k, threads)
-            res[v] = pl.DataFrame({'r': r, 'c': c, v: val})
-        # union of the three lists and fill all three scores for every pair
-        u = pl.concat([res[v].select('r', 'c') for v in res]).unique()
-        u = u.with_columns(pl.col('r').cast(pl.Int64), pl.col('c').cast(pl.Int64))
-        for v in ('name', 'addr', 'joint'):
-            A, B = views[v]
-            u = u.with_columns(pl.Series(v, _pair_cos(A, B, u['r'].to_numpy(), u['c'].to_numpy())))
+        mats, lists = {}, []
+        for v, k in (('name', k_name), ('addr', k_addr)):
+            A, B = build_view(a, b, v)
+            r, c, _ = _topn(A, B, k, threads)
+            lists.append(pl.DataFrame({'r': r, 'c': c}))
+            mats[v] = (A, B)
+        u = pl.concat(lists).unique()
+        r, c = u['r'].to_numpy(), u['c'].to_numpy()
+        for v in ('name', 'addr'):
+            u = u.with_columns(pl.Series(v, _pair_cos(*mats[v], r, c)))
+        del mats
+        u = u.with_columns(((pl.col('name') + pl.col('addr')) / 2).alias('joint'))
         u = (u.sort(['r', 'joint'], descending=[False, True])
              .with_columns(pl.int_range(pl.len()).over('r').alias('rk'))
              .filter(pl.col('rk') < max_cands).drop('rk'))
@@ -150,7 +151,6 @@ def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=15, k_addr=1
         if verbose:
             print(f'  blocking {country}: {a.height} x {b.height} -> {u.height} pairs', flush=True)
         out.append(u)
-        del views
     return pl.concat(out)
 
 

@@ -108,8 +108,6 @@ for k, v in US_STATES.items():
 for k, v in IN_STATES.items():
     STATE_CANON[k] = 'state_' + v
 STATE_CODES = set(US_STATES.values()) | set(IN_STATES.values())
-_STATE_MULTI = sorted([k for k in STATE_CANON if ' ' in k], key=len, reverse=True)
-_STATE_MULTI_RE = re.compile(r'\b(' + '|'.join(re.escape(k) for k in _STATE_MULTI) + r')\b')
 
 INDIC_RE = re.compile(r'[ऀ-෿]')
 _PUNCT_RE = re.compile(r"[^\w\s/\-]")
@@ -212,13 +210,10 @@ class Normalizer:
                 seg = 'state_' + seg
             segs.append(seg)
         s = ' , '.join(segs).replace('&', ' and ')
-        s = _STATE_MULTI_RE.sub(lambda m: ' ' + STATE_CANON[m.group(1)] + ' ', s)
         s = re.sub(r'[#.,;:()\[\]\'"]', ' ', s)
         toks = []
         nums = []
         for t in s.split():
-            if t in STATE_CANON:
-                t = STATE_CANON[t]
             t = ADDR_ABBR.get(t, t)
             toks.append(t)
             for n in _NUM_RE.findall(t):

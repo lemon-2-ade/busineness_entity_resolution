@@ -1,0 +1,6 @@
+train s1: 2206821 rows in 46s
+train s2: 5034616 rows in 103s
+train s3: 5285603 rows in 107s
+test s1: 1732544 rows in 37s
+test s2: 4887273 rows in 119s
+test s3: 5082316 rows in 206s
