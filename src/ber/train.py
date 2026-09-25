@@ -137,10 +137,12 @@ def candidates_with_context(art, split, keep_i1):
     want23 = np.zeros(int(i23.max()) + 1, dtype=bool); want23[i23[kmask]] = True
     cmask = want23[i23]                     # rows competing for the same S2/S3 records
     c = context_features(i1[cmask], i23[cmask], sc[cmask], keep_mask=kmask[cmask])
-    del i1, i23, sc
-    k = pl.Series(np.asarray(keep_i1, dtype=np.int32)).implode()
-    rest = pl.scan_parquet(path).filter(pl.col('i1').is_in(k)).drop('blk_joint').collect()
-    return c.join(rest, on=['i1', 'i23'], how='left')
+    del i1, i23, sc, cmask
+    # context_features preserves file order, so the remaining blocking columns
+    # can be attached positionally (a 20M x 20M hash join would not fit in RAM)
+    rest_cols = [x for x in pl.read_parquet_schema(path) if x not in ('i1', 'i23', 'blk_joint')]
+    rest = pl.read_parquet(path, columns=rest_cols).filter(pl.Series(kmask))
+    return pl.concat([c, rest], how='horizontal')
 
 
 def labelled_candidates(art, data, split='train', keep_i1=None, truth_ids=None):

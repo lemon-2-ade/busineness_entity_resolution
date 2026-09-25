@@ -37,21 +37,25 @@ def score_all(a, cfg, feats, model, model2, emb, e1, e23, t0):
     for cn in sorted(country.unique().to_list()):
         # countries are disjoint in both S1 and S2/S3, so per-country context is exact
         keep = np.nonzero((country == cn).to_numpy())[0]
+        cache = f'{a.art}/scored_{a.split}_{cn}.parquet'      # per-country checkpoint (resumable)
+        if os.path.exists(cache):
+            done = pl.read_parquet(cache)
+            scored.append(done); cand_lists.append(done.select('i1', 'i23'))
+            print(f'[{cn}] loaded {done.height} scored pairs from checkpoint', flush=True)
+            continue
         c = candidates_with_context(a.art, a.split, keep)
         print(f'[{cn}] {c.height} candidate pairs for {len(keep)} S1 ({time.time() - t0:.0f}s)', flush=True)
         cand_lists.append(c.select('i1', 'i23'))
         metas, ps = [], []
-        mm = None
-        if model2 is not None:   # stage-1 features (float32, as in training) are spilled to disk for stage 2
-            mm = np.lib.format.open_memmap(f'{a.art}/_stage1_X.npy', mode='w+', dtype=np.float32,
-                                           shape=(c.height, len(feats)))
+        spills = []   # stage-1 features (float32, exactly as in training) spilled to disk for stage 2
         for i in range(0, c.height, a.chunk):
             meta, X, names = featurise(c.slice(i, a.chunk), a.art, a.split, a.workers, log=False, emb=emb)
             assert names == feats, 'feature mismatch between training and inference'
             ps.append(model.predict(X, num_threads=a.workers).astype(np.float32))
             metas.append(meta.select('i1', 'i23'))
-            if mm is not None:
-                mm[i:i + len(X)] = X
+            if model2 is not None:
+                spills.append(f'{a.art}/_stage1_X_{len(spills)}.npy')
+                np.save(spills[-1], X)
             del meta, X
             print(f'  stage-1 scored {min(i + a.chunk, c.height)}/{c.height} ({time.time() - t0:.0f}s)', flush=True)
         del c
@@ -60,14 +64,20 @@ def score_all(a, cfg, feats, model, model2, emb, e1, e23, t0):
             # stage 2: probability context over the whole country (a closed candidate set)
             pc = np.column_stack(list(prob_context(meta['i1'].to_numpy(), meta['i23'].to_numpy(), p).values()))
             p2 = np.empty_like(p)
-            for i in range(0, len(p), a.chunk):
-                X2 = np.hstack([np.asarray(mm[i:i + a.chunk], dtype=np.float32), pc[i:i + a.chunk]])
-                p2[i:i + a.chunk] = model2.predict(X2, num_threads=a.workers)
+            i = 0
+            for path in spills:
+                X = np.load(path)
+                X2 = np.hstack([X, pc[i:i + len(X)]])
+                p2[i:i + len(X)] = model2.predict(X2, num_threads=a.workers)
+                i += len(X)
+                del X, X2
+                os.remove(path)
             p = p2
-            del mm, pc
-            os.remove(f'{a.art}/_stage1_X.npy')
+            del pc
             print(f'  stage-2 scored ({time.time() - t0:.0f}s)', flush=True)
         scored.append(meta.with_columns(pl.Series('prob', p)))
+        scored[-1].write_parquet(cache)
+        del meta, p
     write_id_lists(f'{a.out}/candidate_pairs.tsv', e1, group_lists(pl.concat(cand_lists), e1, e23),
                    'candidate_entity_ids')
     scored = pl.concat(scored)
