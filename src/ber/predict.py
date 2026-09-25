@@ -1,0 +1,81 @@
+"""Stage 6: score the test candidates and write the two submission files.
+
+    python -m ber.predict --art artifacts --out output
+Writes output/candidate_pairs.tsv (exactly the pairs the model scores) and
+output/matching_results.tsv (final matches, a subset of the candidates).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+
+import lightgbm as lgb
+import numpy as np
+import polars as pl
+
+from .features import context_features
+from .io import write_id_lists
+from .postprocess import exclusive, select_expected_f, select_threshold
+from .train import featurise, load_records
+
+
+def group_lists(sel: pl.DataFrame, e1, e23):
+    g = (sel.with_columns(pl.Series('m', e23[sel['i23'].to_numpy()]))
+         .sort('m').group_by('i1').agg(pl.col('m')))
+    lists = [[] for _ in range(len(e1))]
+    for i, m in zip(g['i1'].to_list(), g['m'].to_list()):
+        lists[i] = m
+    return lists
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--art', default='artifacts')
+    ap.add_argument('--out', default='output')
+    ap.add_argument('--split', default='test')
+    ap.add_argument('--workers', type=int, default=os.cpu_count() or 2)
+    ap.add_argument('--chunk', type=int, default=2_000_000)
+    a = ap.parse_args()
+    t0 = time.time()
+    os.makedirs(a.out, exist_ok=True)
+    cfg = json.load(open(f'{a.art}/model/config.json'))
+    feats = cfg['features']
+    model = lgb.Booster(model_file=f'{a.art}/model/lgb.txt')
+
+    emb = None
+    if 'emb_name_cos' in feats:
+        from .embed import load as load_emb
+        emb = load_emb(a.art, a.split)
+        assert emb is not None, 'model uses embeddings: run `python -m ber.embed --split test` first'
+    s1, s23 = load_records(a.art, a.split)
+    e1 = s1['entity_id'].to_numpy(); e23 = s23['entity_id'].to_numpy()
+    c = context_features(pl.read_parquet(f'{a.art}/cands_{a.split}.parquet'))
+    print(f'{c.height} candidate pairs for {len(e1)} S1', flush=True)
+    write_id_lists(f'{a.out}/candidate_pairs.tsv', e1, group_lists(c.select('i1', 'i23'), e1, e23),
+                   'candidate_entity_ids')
+
+    scored = []
+    for i in range(0, c.height, a.chunk):
+        part = featurise(c.slice(i, a.chunk), s1, s23, a.workers, log=False, emb=emb)
+        p = model.predict(part.select(feats).to_numpy(), num_threads=a.workers).astype(np.float32)
+        scored.append(part.select('i1', 'i23').with_columns(pl.Series('prob', p)))
+        print(f'  scored {min(i + a.chunk, c.height)}/{c.height} ({time.time() - t0:.0f}s)', flush=True)
+    scored = pl.concat(scored)
+    scored.write_parquet(f'{a.art}/scored_{a.split}.parquet')
+
+    ex = exclusive(scored)
+    method, param = cfg['post']['method'], cfg['post']['param']
+    if method == 'thr':
+        sel = select_threshold(ex, float(param))
+    else:
+        sel = select_expected_f(ex, miss_prior=float(param[0]), min_prob=float(param[1]))
+    write_id_lists(f'{a.out}/matching_results.tsv', e1, group_lists(sel, e1, e23), 'matched_entity_ids')
+    n_match = sel['i1'].n_unique()
+    print(f'wrote {sel.height} matches; {n_match}/{len(e1)} S1 entities matched '
+          f'({1 - n_match / len(e1):.3f} predicted singletons) in {time.time() - t0:.0f}s')
+
+
+if __name__ == '__main__':
+    main()

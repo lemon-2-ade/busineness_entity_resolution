@@ -174,7 +174,7 @@ def search_block(X, rows1, rows23, ks, caps, threads, chunk=50_000):
 
 
 BLOCK_COLS = ['entity_id', 'country', 'name_core', 'name_alt', 'name_compact', 'addr_core', 'state']
-DEFAULTS = dict(k_name=15, k_addr=15, k_joint=30, cap_name=20000, cap_addr=20000, resid_ks=(5, 5, 10), keep=(20, 5, 10))
+DEFAULTS = dict(k_name=15, k_addr=15, k_joint=30, cap_name=5000, cap_addr=5000, resid_ks=(5, 5, 10), keep=(20, 5, 10))
 # Telangana was carved out of Andhra Pradesh; vendors still mix the two.
 STATE_ALIAS = {'state_tg': 'state_ap'}
 
@@ -220,8 +220,12 @@ def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=15, k_addr=1
                 parts.append(search_block(X, rows1, rows23, ks, caps, threads))
                 continue
             lo, hi = np.searchsorted(sg2, g, 'left'), np.searchsorted(sg2, g, 'right')
+            tb = time.time()
             parts.append(search_block(X, rows1, np.sort(order2[lo:hi]), ks, caps, threads))
             parts.append(search_block(X, rows1, resid, resid_ks, caps, threads))
+            if verbose and len(rows1) > 20000:
+                print(f'    block {g}: {len(rows1)} x {hi - lo} (+{len(resid)} residual) {time.time() - tb:.0f}s',
+                      flush=True)
         u = pl.concat([p for p in parts if p is not None]).unique(['r', 'c'])
         u = u.select(pl.Series('i1', ia[u['r'].to_numpy()].astype(np.int32)),
                      pl.Series('i23', ib[u['c'].to_numpy()].astype(np.int32)),

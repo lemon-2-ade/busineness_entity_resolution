@@ -8,13 +8,13 @@ from ber.io import read_ground_truth
 
 ap = argparse.ArgumentParser(); ap.add_argument('--n', type=int, default=50000); ap.add_argument('--art', default='artifacts')
 ap.add_argument('--kn', type=int, default=15); ap.add_argument('--ka', type=int, default=15); ap.add_argument('--kj', type=int, default=30)
-ap.add_argument('--maxc', type=int, default=30)
+ap.add_argument('--capn', type=int, default=3000); ap.add_argument('--capa', type=int, default=3000)
 a = ap.parse_args()
 from ber.blocking import BLOCK_COLS
 s1 = pl.read_parquet(f'{a.art}/train_s1.parquet', columns=BLOCK_COLS).sample(a.n, seed=0)
 s23 = pl.concat([pl.read_parquet(f'{a.art}/train_s{i}.parquet', columns=BLOCK_COLS) for i in (2, 3)])
 t = time.time()
-c = generate_candidates(s1, s23, a.kn, a.ka, a.kj)
+c = generate_candidates(s1, s23, a.kn, a.ka, a.kj, cap_name=a.capn, cap_addr=a.capa)
 print('time', time.time() - t)
 s23 = s23.select('entity_id'); import gc; gc.collect()
 _, pairs = read_ground_truth('data/train/train_ground_truth.tsv')

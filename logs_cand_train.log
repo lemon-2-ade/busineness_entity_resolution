@@ -1,1 +1,13 @@
-  [India] 100000/883188 S1 rows, 563s
+    block state_wb: 56873 x 259277 (+164498 residual) 33s
+    block state_mh: 191679 x 868395 (+164498 residual) 127s
+    block state_ap: 73309 x 330436 (+164498 residual) 50s
+    block state_gj: 57448 x 259499 (+164498 residual) 35s
+    block state_dl: 121359 x 550308 (+164498 residual) 77s
+    block state_kl: 35376 x 129201 (+164498 residual) 18s
+    block state_ka: 70109 x 317533 (+164498 residual) 43s
+    block state_up: 73643 x 333379 (+164498 residual) 43s
+    block state_hr: 35845 x 161459 (+164498 residual) 21s
+    block state_rj: 32186 x 146086 (+164498 residual) 17s
+    block state_br: 22852 x 103213 (+164498 residual) 11s
+    block state_mp: 22512 x 102088 (+164498 residual) 12s
+    block state_tn: 63297 x 286396 (+164498 residual) 37s
