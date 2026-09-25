@@ -1,0 +1,12 @@
+data
+data/
+output/
+artifacts/
+*.parquet
+*.npy
+*.npz
+*.pkl
+*.txt.model
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
