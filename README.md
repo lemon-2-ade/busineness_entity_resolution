@@ -38,9 +38,10 @@ export PYTHONPATH=src MALLOC_ARENA_MAX=2
 
 python -m ber.preprocess --data data --out artifacts          # ~10 min (train+test)
 python -m ber.candidates --art artifacts --split train        # ~30 min on 2 cores
-python -m ber.candidates --art artifacts --split test         # ~30 min on 2 cores
-python -m ber.train      --art artifacts --data data          # ~40 min; prints validation F0.5
-python -m ber.predict    --art artifacts --out output         # ~30 min
+python -m ber.candidates --art artifacts --split test         # ~21 min on 2 cores
+python -m ber.train      --art artifacts --data data          # ~55 min; prints validation F0.5
+python -m ber.predict    --art artifacts --out output         # ~2 h on 2 cores
+python scripts/check_outputs.py --out output --test-dir data/test   # quick self-check
 python3 path/to/student_resource/utils/validate_submission.py \
     --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv \
     --test-dir data/test

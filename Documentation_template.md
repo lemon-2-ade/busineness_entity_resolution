@@ -183,4 +183,4 @@ Post-processing on the validation fold: exclusivity + threshold 0.70 gives
 0.9791; threshold 0.50 gives 0.9769; the expected-F top-k rule gives 0.9793;
 threshold 0.5 without exclusivity gives 0.9768.
 
-Test-set summary: TEST_SUMMARY_PLACEHOLDER
+Test-set summary: 41,644,908 candidate pairs → 5,741,614 matches (3.31 per S1); 6.2% of S1 predicted singletons; France 3.05 matches/S1 with 8.1% empty vs India 3.35 / 5.9% and US 3.38 / 5.8%.
