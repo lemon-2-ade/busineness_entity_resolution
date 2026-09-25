@@ -23,7 +23,7 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from .features import REC_COLS, context_features, pair_features, raw_flags
+from .features import REC_COLS, context_features, pair_features, prob_context, raw_flags
 from .io import read_ground_truth
 from .metrics import breakdown
 from .postprocess import exclusive, select_expected_f, select_threshold, to_lists
@@ -39,6 +39,18 @@ def entity_ids(art, split):
     return e1, e23
 
 
+def name_freq_table(art, split):
+    """How many records (S1+S2+S3 of the split, same country) share each core
+    name.  Unsupervised statistic of the split itself - no labels used."""
+    path = f'{art}/{split}_namefreq.parquet'
+    if not os.path.exists(path):
+        lf = pl.concat([pl.scan_parquet(f'{art}/{split}_s{i}.parquet').select('country', 'name_core')
+                        for i in (1, 2, 3)])
+        lf.group_by('country', 'name_core').agg(pl.len().cast(pl.Float32).alias('name_freq')) \
+            .collect().write_parquet(path)
+    return pl.read_parquet(path)
+
+
 class RecordStore:
     """Feature columns of every record of a source, stored as uncompressed
     Arrow IPC and memory-mapped: gathering the rows referenced by a chunk of
@@ -51,8 +63,11 @@ class RecordStore:
         for src in sources:
             path = f'{art}/{split}_s{src}.rec.arrow'
             if not os.path.exists(path):
-                raw_flags(pl.read_parquet(f'{art}/{split}_s{src}.parquet', columns=cols)) \
-                    .write_ipc(path, compression='uncompressed')
+                freq = name_freq_table(art, split)
+                df = raw_flags(pl.read_parquet(f'{art}/{split}_s{src}.parquet', columns=cols + ['country']))
+                df = df.join(freq, on=['country', 'name_core'], how='left').drop('country')
+                df.write_ipc(path, compression='uncompressed')
+                del df
                 gc.collect()
             f = pl.read_ipc(path, memory_map=True)
             self.frames.append(f)
@@ -151,17 +166,25 @@ def labelled_candidates(art, data, split='train', keep_i1=None, truth_ids=None):
     return c, truth, e1, e23
 
 
-def geo_split(art, split, valid_frac, seed):
-    """Boolean mask over S1 rows: True = validation (whole states held out).
-    The key is country|state because state codes collide across countries."""
+def geo_split(art, split, fracs, seed):
+    """Assign whole geo blocks (country|state) to held-out folds.
+    Returns (fold array over S1 rows: 0 = training pool, k = k-th held-out
+    fold, list of held-out keys per fold).  The key is country|state because
+    state codes collide across countries."""
     s1 = pl.read_parquet(f'{art}/{split}_s1.parquet', columns=['state', 'country'])
     key = (s1['country'] + '|' + s1['state'].str.split(' ').list.first().fill_null('')).alias('g')
     groups = key.value_counts().sort('g').sample(fraction=1.0, shuffle=True, seed=seed)
-    acc = 0; valid = set()
-    for g, n in groups.iter_rows():
-        if not g.endswith('|') and acc + n <= valid_frac * s1.height:
-            valid.add(g); acc += n
-    return key.is_in(list(valid)).to_numpy(), sorted(valid)
+    fold_of = {}; folds = []
+    for k, frac in enumerate(fracs, start=1):
+        acc = 0; chosen = []
+        for g, n in groups.iter_rows():
+            if g in fold_of or g.endswith('|'):
+                continue
+            if acc + n <= frac * s1.height:
+                fold_of[g] = k; chosen.append(g); acc += n
+        folds.append(sorted(chosen))
+    fold = key.replace_strict(fold_of, default=0, return_dtype=pl.Int8).to_numpy()
+    return fold, folds
 
 
 def tune_postprocessing(cva, truth, e1, e23, va_s1):
@@ -181,30 +204,59 @@ def tune_postprocessing(cva, truth, e1, e23, va_s1):
     return max(results, key=lambda r: r[2]['macro_f05'])
 
 
+LGB_PARAMS = dict(objective='binary', learning_rate=0.05, num_leaves=127, min_data_in_leaf=100,
+                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+                  max_bin=255, verbose=-1)
+STAGE2_PARAMS = dict(objective='binary', learning_rate=0.05, num_leaves=63, min_data_in_leaf=200,
+                     feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+                     max_bin=255, verbose=-1)
+
+
+def fit(params, X, y, Xv, yv, names, workers, seed):
+    p = dict(params, num_threads=workers, seed=seed)
+    dtr = lgb.Dataset(X, y, feature_name=names, free_raw_data=True)
+    dva = lgb.Dataset(Xv, yv, reference=dtr)
+    return lgb.train(p, dtr, num_boost_round=4000, valid_sets=[dva], valid_names=['valid'],
+                     callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)])
+
+
+def stage2_matrix(meta, X, prob):
+    """Stage-2 design matrix = stage-1 features + probability-context features."""
+    pc = prob_context(meta['i1'].to_numpy(), meta['i23'].to_numpy(), prob)
+    return np.hstack([X, np.column_stack(list(pc.values())).astype(np.float32)]), list(pc.keys())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--art', default='artifacts')
     ap.add_argument('--data', default='data')
-    ap.add_argument('--n-train', type=int, default=250_000, help='#train S1 entities to featurise')
-    ap.add_argument('--valid-frac', type=float, default=0.06, help='fraction of S1 (by state) held out')
+    ap.add_argument('--n-train', type=int, default=250_000, help='#train S1 entities to featurise (stage 1)')
+    ap.add_argument('--valid-frac', type=float, default=0.06, help='fraction of S1 (whole states) for validation')
+    ap.add_argument('--stage2-frac', type=float, default=0.08,
+                    help='fraction of S1 (whole states) to train the stage-2 re-scorer; 0 disables stage 2')
     ap.add_argument('--workers', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--emb', action='store_true', help='add the optional GPU name-embedding feature')
     a = ap.parse_args()
     t0 = time.time()
     rng = np.random.default_rng(a.seed)
+    use2 = a.stage2_frac > 0
 
-    is_valid, vgroups = geo_split(a.art, 'train', a.valid_frac, a.seed)
-    print(f'valid: {is_valid.sum()} S1 in {len(vgroups)} held-out states {vgroups}', flush=True)
-    tr_ids = rng.choice(np.nonzero(~is_valid)[0], size=min(a.n_train, int((~is_valid).sum())), replace=False)
-    va_ids = np.nonzero(is_valid)[0]
+    fold, folds = geo_split(a.art, 'train', [a.valid_frac] + ([a.stage2_frac] if use2 else []), a.seed)
+    print(f'valid fold: {(fold == 1).sum()} S1 in {folds[0]}', flush=True)
+    if use2:
+        print(f'stage-2 fold: {(fold == 2).sum()} S1 in {folds[1]}', flush=True)
+    tr_ids = rng.choice(np.nonzero(fold == 0)[0], size=min(a.n_train, int((fold == 0).sum())), replace=False)
+    va_ids = np.nonzero(fold == 1)[0]
+    s2_ids = np.nonzero(fold == 2)[0]
     e1 = pl.read_parquet(f'{a.art}/train_s1.parquet', columns=['entity_id'])['entity_id']
-    c, truth, e1, e23 = labelled_candidates(a.art, a.data, keep_i1=np.concatenate([tr_ids, va_ids]),
+    c, truth, e1, e23 = labelled_candidates(a.art, a.data, keep_i1=np.concatenate([tr_ids, va_ids, s2_ids]),
                                             truth_ids=e1.gather(va_ids))
-    ctr = c.filter(pl.col('i1').is_in(pl.Series(tr_ids.astype(np.int32)).implode()))
-    cva = c.filter(pl.col('i1').is_in(pl.Series(va_ids.astype(np.int32)).implode()))
+    sel = lambda ids: c.filter(pl.col('i1').is_in(pl.Series(ids.astype(np.int32)).implode()))
+    ctr, cva, cs2 = sel(tr_ids), sel(va_ids), sel(s2_ids)
     del c; gc.collect()
-    print(f'train pairs {ctr.height} (pos {ctr["y"].sum()}), valid pairs {cva.height}', flush=True)
+    print(f'pairs: stage-1 train {ctr.height} (pos {ctr["y"].sum()}), valid {cva.height}, stage-2 {cs2.height}',
+          flush=True)
 
     emb = None
     if a.emb:
@@ -215,28 +267,56 @@ def main():
     ytr = mtr['y'].to_numpy()
     print(f'{len(feats)} features: {feats}', flush=True)
     del ctr, mtr; gc.collect()
-    cva, Xva, _ = featurise(cva, a.art, 'train', a.workers, emb=emb)
-
-    params = dict(objective='binary', learning_rate=0.05, num_leaves=127, min_data_in_leaf=100,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  max_bin=255, num_threads=a.workers, verbose=-1, seed=a.seed)
-    dtr = lgb.Dataset(Xtr, ytr, feature_name=feats, free_raw_data=True)
-    dva = lgb.Dataset(Xva, cva['y'].to_numpy(), reference=dtr)
-    model = lgb.train(params, dtr, num_boost_round=3000, valid_sets=[dva], valid_names=['valid'],
-                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
+    mva, Xva, _ = featurise(cva, a.art, 'train', a.workers, emb=emb)
+    del cva
+    # stage 1 early-stops on the stage-2 fold when it exists (keeps the validation fold untouched)
+    if use2:
+        ms2, Xs2, _ = featurise(cs2, a.art, 'train', a.workers, emb=emb)
+        del cs2
+        m1 = fit(LGB_PARAMS, Xtr, ytr, Xs2, ms2['y'].to_numpy(), feats, a.workers, a.seed)
+    else:
+        m1 = fit(LGB_PARAMS, Xtr, ytr, Xva, mva['y'].to_numpy(), feats, a.workers, a.seed)
+    del Xtr, ytr; gc.collect()
     os.makedirs(f'{a.art}/model', exist_ok=True)
-    model.save_model(f'{a.art}/model/lgb.txt')
-    imp = sorted(zip(feats, model.feature_importance('gain')), key=lambda x: -x[1])
-    print('feature importance (gain):', [(f, round(g)) for f, g in imp], flush=True)
+    m1.save_model(f'{a.art}/model/lgb.txt')
+    imp = sorted(zip(feats, m1.feature_importance('gain')), key=lambda x: -x[1])
+    print('stage-1 feature importance (gain):', [(f, round(g)) for f, g in imp], flush=True)
 
-    cva = cva.with_columns(pl.Series('prob', model.predict(Xva, num_threads=a.workers).astype(np.float32)))
-    cva.write_parquet(f'{a.art}/valid_scored.parquet')
-    best = tune_postprocessing(cva, truth, e1, e23, e1.gather(va_ids).to_list())
-    print('BEST', best, flush=True)
-    cfg = {'features': feats, 'best_iteration': model.best_iteration, 'params': params,
-           'post': {'method': best[0], 'param': best[1]}, 'valid': best[2], 'valid_states': vgroups,
-           'n_train_s1': int(len(tr_ids))}
+    pva = m1.predict(Xva, num_threads=a.workers).astype(np.float32)
+    cfg = {'features': feats, 'best_iteration': m1.best_iteration, 'params': LGB_PARAMS,
+           'valid_states': folds[0], 'n_train_s1': int(len(tr_ids)), 'stage2': None}
+    va_s1 = e1.gather(va_ids).to_list()
+    print('--- stage-1 only', flush=True)
+    best1 = tune_postprocessing(mva.select('i1', 'i23', 'y').with_columns(pl.Series('prob', pva)),
+                                truth, e1, e23, va_s1)
+    print('BEST stage-1', best1, flush=True)
+    best, pfinal = best1, pva
+    if use2:
+        ps2 = m1.predict(Xs2, num_threads=a.workers).astype(np.float32)
+        X2, names2 = stage2_matrix(ms2, Xs2, ps2); del Xs2
+        X2v, _ = stage2_matrix(mva, Xva, pva)
+        # stage 2 is fitted on the stage-2 fold; early stopping on 20% of that
+        # fold's S1 entities, so the validation fold stays untouched.
+        es = (ms2['i1'].to_numpy() % 5) == 0
+        y2 = ms2['y'].to_numpy()
+        m2 = fit(STAGE2_PARAMS, X2[~es], y2[~es], X2[es], y2[es], feats + names2, a.workers, a.seed)
+        m2.save_model(f'{a.art}/model/lgb_stage2.txt')
+        imp2 = sorted(zip(feats + names2, m2.feature_importance('gain')), key=lambda x: -x[1])
+        print('stage-2 feature importance (gain):', [(f, round(g)) for f, g in imp2[:20]], flush=True)
+        p2 = m2.predict(X2v, num_threads=a.workers).astype(np.float32)
+        print('--- stage-2', flush=True)
+        best2 = tune_postprocessing(mva.select('i1', 'i23', 'y').with_columns(pl.Series('prob', p2)),
+                                    truth, e1, e23, va_s1)
+        print('BEST stage-2', best2, flush=True)
+        if best2[2]['macro_f05'] > best1[2]['macro_f05']:
+            best, pfinal = best2, p2
+            cfg['stage2'] = {'features': names2, 'best_iteration': m2.best_iteration, 'params': STAGE2_PARAMS}
+    mva.select('i1', 'i23', 'y').with_columns(pl.Series('prob', pfinal)).write_parquet(
+        f'{a.art}/valid_scored.parquet')
+    cfg.update({'post': {'method': best[0], 'param': best[1]}, 'valid': best[2],
+                'valid_stage1': best1[2]})
     json.dump(cfg, open(f'{a.art}/model/config.json', 'w'), indent=1, default=str)
+    print('FINAL', cfg['post'], cfg['valid'], flush=True)
     print(f'done in {time.time() - t0:.0f}s')
 
 

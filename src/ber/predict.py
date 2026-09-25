@@ -17,6 +17,7 @@ import polars as pl
 
 from .io import write_id_lists
 from .postprocess import exclusive, select_expected_f, select_threshold
+from .features import prob_context
 from .train import candidates_with_context, entity_ids, featurise
 
 
@@ -42,6 +43,7 @@ def main():
     cfg = json.load(open(f'{a.art}/model/config.json'))
     feats = cfg['features']
     model = lgb.Booster(model_file=f'{a.art}/model/lgb.txt')
+    model2 = lgb.Booster(model_file=f'{a.art}/model/lgb_stage2.txt') if cfg.get('stage2') else None
 
     emb = None
     if 'emb_name_cos' in feats:
@@ -58,14 +60,34 @@ def main():
         c = candidates_with_context(a.art, a.split, keep)
         print(f'[{cn}] {c.height} candidate pairs for {len(keep)} S1 ({time.time() - t0:.0f}s)', flush=True)
         cand_lists.append(c.select('i1', 'i23'))
+        metas, ps = [], []
+        mm = None
+        if model2 is not None:   # stage-1 features are spilled to disk for the stage-2 pass
+            mm = np.lib.format.open_memmap(f'{a.art}/_stage1_X.npy', mode='w+', dtype=np.float16,
+                                           shape=(c.height, len(feats)))
         for i in range(0, c.height, a.chunk):
             meta, X, names = featurise(c.slice(i, a.chunk), a.art, a.split, a.workers, log=False, emb=emb)
             assert names == feats, 'feature mismatch between training and inference'
-            p = model.predict(X, num_threads=a.workers).astype(np.float32)
-            scored.append(meta.select('i1', 'i23').with_columns(pl.Series('prob', p)))
+            ps.append(model.predict(X, num_threads=a.workers).astype(np.float32))
+            metas.append(meta.select('i1', 'i23'))
+            if mm is not None:
+                mm[i:i + len(X)] = X
             del meta, X
-            print(f'  scored {min(i + a.chunk, c.height)}/{c.height} ({time.time() - t0:.0f}s)', flush=True)
+            print(f'  stage-1 scored {min(i + a.chunk, c.height)}/{c.height} ({time.time() - t0:.0f}s)', flush=True)
         del c
+        meta = pl.concat(metas); p = np.concatenate(ps)
+        if model2 is not None:
+            # stage 2: probability context over the whole country (a closed candidate set)
+            pc = np.column_stack(list(prob_context(meta['i1'].to_numpy(), meta['i23'].to_numpy(), p).values()))
+            p2 = np.empty_like(p)
+            for i in range(0, len(p), a.chunk):
+                X2 = np.hstack([np.asarray(mm[i:i + a.chunk], dtype=np.float32), pc[i:i + a.chunk]])
+                p2[i:i + a.chunk] = model2.predict(X2, num_threads=a.workers)
+            p = p2
+            del mm, pc
+            os.remove(f'{a.art}/_stage1_X.npy')
+            print(f'  stage-2 scored ({time.time() - t0:.0f}s)', flush=True)
+        scored.append(meta.with_columns(pl.Series('prob', p)))
     write_id_lists(f'{a.out}/candidate_pairs.tsv', e1, group_lists(pl.concat(cand_lists), e1, e23),
                    'candidate_entity_ids')
     scored = pl.concat(scored)
