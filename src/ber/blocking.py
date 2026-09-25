@@ -9,14 +9,32 @@ is used as an opaque string, so France is handled like any other value):
                    (typo / word-split / domain-name robust)
   * ADDRESS view - address core tokens + adjacent token bigrams
                    (catches pure-alias names such as "Lumquo" at the S1 address)
+  * JOINT view   - both views concatenated (cos_joint = mean of the two); by
+                   far the best single ranking because names are highly
+                   non-unique (~50% of S1 core names repeat) while addresses
+                   are nearly unique (3-4% repeat).
 
-The per-view top-k lists are unioned; each candidate keeps both blocking
-cosines (features for the matcher).  The union is ranked by the mean of the
-two cosines ("joint") and truncated to at most `max_cands` per S1 entity.
+Geo-partitioning: retrieval is done inside (country, state) partitions
+(95% of true pairs share the canonical state; 4.7% of S2/S3 records have no
+state - those form a per-country "residual" pool that every S1 of the country
+is also searched against).  S1 records without a single canonical state
+(e.g. France, whose regions are not in the state dictionary) are searched
+against the whole country.  This cuts the sparse-product work by ~20x and
+makes IDF local (a street name that is rare *in the state* is informative).
+
+The per-view top-k lists are unioned and every pair keeps its name/addr/joint
+cosines and per-S1 ranks as matcher features.  The union is truncated by rank
+(see `generate_candidates`); what survives is exactly the set the matcher
+scores (candidate_pairs.tsv).
+
+Measured on a 50k-S1 train sample: without geo-partitioning (global IDF,
+country-wide search) union recall was 96.1% at ~42/S1 and ~5 ms/S1;
+with geo-partitioning 99.0% at ~54/S1, truncated to 98.5% at ~24/S1.
 """
 from __future__ import annotations
 
 import math
+import time
 from array import array
 from collections import defaultdict
 
@@ -48,12 +66,13 @@ def addr_tokens(core: str):
 
 
 class Vocab:
-    """Token -> column index with document frequencies, built on the fly."""
+    """Token -> column index, built on the fly."""
 
     def __init__(self):
         self.idx = {}
 
     def matrix(self, token_lists):
+        """Binary CSR (as indptr/indices arrays) for an iterable of token lists."""
         indptr = array('q', [0]); indices = array('i')
         idx = self.idx
         for toks in token_lists:
@@ -68,90 +87,55 @@ class Vocab:
         return indptr, indices
 
 
-def _tfidf(indptr, indices, ncols, idf):
-    indptr = np.frombuffer(indptr, dtype=np.int64); indices = np.frombuffer(indices, dtype=np.int32)
-    data = idf[indices].astype(np.float32)
-    m = sp.csr_matrix((data, indices, indptr), shape=(len(indptr) - 1, ncols))
-    norms = np.sqrt(np.asarray(m.multiply(m).sum(1)).ravel()); norms[norms == 0] = 1
-    return sp.diags((1 / norms).astype(np.float32)) @ m
+def _binary(ip, ix, ncols):
+    """Memory-lean binary CSR: bool data + int32 index arrays (no copies)."""
+    ip = np.frombuffer(ip, dtype=np.int64)
+    if ip[-1] < 2**31 - 1:
+        ip = ip.astype(np.int32)
+    ix = np.frombuffer(ix, dtype=np.int32).copy()
+    m = sp.csr_matrix((np.ones(len(ix), dtype=np.bool_), ix, ip), shape=(len(ip) - 1, ncols), copy=False)
+    return m
 
 
-def build_view(s1: pl.DataFrame, s23: pl.DataFrame, view: str, max_df_frac=0.02):
-    """Returns (A (n1 x V), B (n23 x V)) L2-normalised tf-idf matrices for one view.
-    IDF is computed on the target side (S2+S3); very common tokens
-    (df > max_df_frac * n23) are dropped from blocking - they carry little
-    identity signal and dominate the cost of the sparse product."""
-    if view == 'name':
-        fn = lambda df: (name_tokens(a, b, c) for a, b, c in zip(df['name_core'], df['name_alt'], df['name_compact']))
-    else:
-        fn = lambda df: (addr_tokens(a) for a in df['addr_core'])
-    voc = Vocab()
-    ip2, ix2 = voc.matrix(fn(s23))
-    ip1, ix1 = voc.matrix(fn(s1))
-    V = len(voc.idx); n23 = len(ip2) - 1
-    del voc
-    df_ = np.bincount(np.frombuffer(ix2, dtype=np.int32), minlength=V).astype(np.float64)
-    idf = np.log((n23 + 1) / (df_ + 1)) + 1
-    idf[df_ > max_df_frac * n23] = 0.0          # prune stop-tokens
-    idf[df_ == 0] = 0.0                         # tokens absent from target side
-    A = _tfidf(ip1, ix1, V, idf); del ip1, ix1
-    B = _tfidf(ip2, ix2, V, idf); del ip2, ix2
-    A.eliminate_zeros(); B.eliminate_zeros()
-    return A, B
+def tokenize_views(s1: pl.DataFrame, s23: pl.DataFrame):
+    """Binary token matrices for both views: {view: (X1, X2)}."""
+    out = {}
+    for view in ('name', 'addr'):
+        if view == 'name':
+            fn = lambda df: (name_tokens(a, b, c) for a, b, c in
+                             zip(df['name_core'], df['name_alt'], df['name_compact']))
+        else:
+            fn = lambda df: (addr_tokens(a) for a in df['addr_core'])
+        voc = Vocab()
+        ip2, ix2 = voc.matrix(fn(s23))
+        ip1, ix1 = voc.matrix(fn(s1))
+        V = len(voc.idx)
+        out[view] = (_binary(ip1, ix1, V), _binary(ip2, ix2, V))
+    return out
 
 
-def _topn(A, B, k, threads, chunk=20000):
-    """Row-wise top-k of A @ B.T -> (rows, cols, vals)."""
-    BT = B.T.tocsr()
-    rs, cs, vs = [], [], []
-    for i in range(0, A.shape[0], chunk):
-        C = sp_matmul_topn(A[i:i + chunk], BT, top_n=k, threshold=0.05, sort=False, n_threads=threads)
-        C = C.tocoo()
-        rs.append(C.row.astype(np.int64) + i); cs.append(C.col.astype(np.int64)); vs.append(C.data.astype(np.float32))
-    if not rs:
-        return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
-    return np.concatenate(rs), np.concatenate(cs), np.concatenate(vs)
+def _weighted(X, idf):
+    """rows of binary CSR X -> idf-weighted, L2-normalised float32 CSR (one copy)."""
+    data = idf[X.indices]
+    sq = data * data
+    rn = np.zeros(X.shape[0], dtype=np.float32)
+    nz = np.diff(X.indptr) > 0
+    rn[nz] = np.add.reduceat(sq, X.indptr[:-1][nz]) if len(sq) else 0
+    rn = np.sqrt(rn); rn[rn == 0] = 1
+    data /= np.repeat(rn, np.diff(X.indptr))
+    m = sp.csr_matrix((data, X.indices, X.indptr), shape=X.shape)
+    m.eliminate_zeros()
+    return m
 
 
-BLOCK_COLS = ['entity_id', 'country', 'name_core', 'name_alt', 'name_compact', 'addr_core']
-
-
-def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=20, k_addr=20, max_cands=30,
-                        threads=2, verbose=True):
-    """Returns a polars frame (i1, i23, blk_name, blk_addr, blk_joint) with row
-    indices into s1 / s23 plus the blocking cosines.  blk_joint is the mean of
-    the name and address cosines and is used to rank / truncate the union."""
-    out = []
-    s1 = s1.select([c for c in BLOCK_COLS if c in s1.columns]).with_row_index('_i1')
-    s23 = s23.select([c for c in BLOCK_COLS if c in s23.columns]).with_row_index('_i23')
-    for country in sorted(set(s1['country'].unique().to_list())):
-        a = s1.filter(pl.col('country') == country)
-        b = s23.filter(pl.col('country') == country)
-        if a.height == 0 or b.height == 0:
-            continue
-        mats, lists = {}, []
-        for v, k in (('name', k_name), ('addr', k_addr)):
-            A, B = build_view(a, b, v)
-            r, c, _ = _topn(A, B, k, threads)
-            lists.append(pl.DataFrame({'r': r, 'c': c}))
-            mats[v] = (A, B)
-        u = pl.concat(lists).unique()
-        r, c = u['r'].to_numpy(), u['c'].to_numpy()
-        for v in ('name', 'addr'):
-            u = u.with_columns(pl.Series(v, _pair_cos(*mats[v], r, c)))
-        del mats
-        u = u.with_columns(((pl.col('name') + pl.col('addr')) / 2).alias('joint'))
-        u = (u.sort(['r', 'joint'], descending=[False, True])
-             .with_columns(pl.int_range(pl.len()).over('r').alias('rk'))
-             .filter(pl.col('rk') < max_cands).drop('rk'))
-        ia = a['_i1'].to_numpy(); ib = b['_i23'].to_numpy()
-        u = u.select(pl.Series('i1', ia[u['r'].to_numpy()]), pl.Series('i23', ib[u['c'].to_numpy()]),
-                     pl.col('name').alias('blk_name'), pl.col('addr').alias('blk_addr'),
-                     pl.col('joint').alias('blk_joint'))
-        if verbose:
-            print(f'  blocking {country}: {a.height} x {b.height} -> {u.height} pairs', flush=True)
-        out.append(u)
-    return pl.concat(out)
+def weight(X1, X2, cap):
+    """IDF (computed on the target block X2) weighting + L2 norm.  Tokens with
+    df > cap inside the block are dropped (stop-tokens for blocking)."""
+    df_ = np.bincount(X2.indices, minlength=X2.shape[1])
+    n = X2.shape[0]
+    idf = (np.log((n + 1) / (df_ + 1)) + 1).astype(np.float32)
+    idf[(df_ > cap) | (df_ == 0)] = 0
+    return _weighted(X1, idf), _weighted(X2, idf)
 
 
 def _pair_cos(A, B, r, c, chunk=2_000_000):
@@ -161,3 +145,93 @@ def _pair_cos(A, B, r, c, chunk=2_000_000):
         a = A[r[i:i + chunk]]; b = B[c[i:i + chunk]]
         out[i:i + chunk] = np.asarray(a.multiply(b).sum(1)).ravel()
     return out
+
+
+def search_block(X, rows1, rows23, ks, caps, threads, chunk=50_000):
+    """Top-k retrieval of S1 rows `rows1` against S23 rows `rows23` for the
+    three views.  Returns frame (r, c, blk_name, blk_addr) with *global* row
+    numbers (within the country frame)."""
+    if len(rows1) == 0 or len(rows23) == 0:
+        return None
+    An, Bn = weight(X['name'][0][rows1], X['name'][1][rows23], caps[0])
+    Aa, Ba = weight(X['addr'][0][rows1], X['addr'][1][rows23], caps[1])
+    w = np.float32(1 / math.sqrt(2))
+    Aj = (sp.hstack([An, Aa], format='csr') * w).tocsr()
+    BjT = (sp.hstack([Bn, Ba], format='csr') * w).T.tocsr()
+    BnT, BaT = Bn.T.tocsr(), Ba.T.tocsr()
+    out = []
+    for i in range(0, len(rows1), chunk):
+        sl = slice(i, i + chunk)
+        lists = []
+        for A, BT, k in ((An, BnT, ks[0]), (Aa, BaT, ks[1]), (Aj, BjT, ks[2])):
+            C = sp_matmul_topn(A[sl], BT, top_n=k, threshold=0.02, sort=False, n_threads=threads).tocoo()
+            lists.append(pl.DataFrame({'r': C.row.astype(np.int64) + i, 'c': C.col.astype(np.int64)}))
+        u = pl.concat(lists).unique()
+        r, c = u['r'].to_numpy(), u['c'].to_numpy()
+        out.append(pl.DataFrame({'r': rows1[r], 'c': rows23[c],
+                                 'blk_name': _pair_cos(An, Bn, r, c), 'blk_addr': _pair_cos(Aa, Ba, r, c)}))
+    return pl.concat(out)
+
+
+BLOCK_COLS = ['entity_id', 'country', 'name_core', 'name_alt', 'name_compact', 'addr_core', 'state']
+DEFAULTS = dict(k_name=15, k_addr=15, k_joint=30, cap_name=20000, cap_addr=20000, resid_ks=(5, 5, 10), keep=(20, 5, 10))
+# Telangana was carved out of Andhra Pradesh; vendors still mix the two.
+STATE_ALIAS = {'state_tg': 'state_ap'}
+
+
+def generate_candidates(s1: pl.DataFrame, s23: pl.DataFrame, k_name=15, k_addr=15, k_joint=30,
+                        cap_name=20000, cap_addr=20000, resid_ks=(5, 5, 10), keep=(20, 5, 10), threads=2,
+                        verbose=True):
+    """Returns a polars frame (i1, i23, blk_name, blk_addr, blk_joint,
+    rk_joint, rk_name, rk_addr) with row indices into s1 / s23, the blocking
+    cosines and the per-S1 rank of the candidate under each cosine.
+
+    The raw union (~54/S1, 99.0% pair recall) is truncated to
+    joint-rank <= keep[0] OR name-rank <= keep[1] OR addr-rank <= keep[2]
+    (~24/S1, 98.5% recall on a 50k-S1 train sample)."""
+    out = []
+    ks, caps = (k_name, k_addr, k_joint), (cap_name, cap_addr)
+    s1 = s1.select([c for c in BLOCK_COLS if c in s1.columns]).with_row_index('_i1')
+    s23 = s23.select([c for c in BLOCK_COLS if c in s23.columns]).with_row_index('_i23')
+    for country in sorted(set(s1['country'].unique().to_list())):
+        t0 = time.time()
+        a = s1.filter(pl.col('country') == country)
+        b = s23.filter(pl.col('country') == country)
+        if a.height == 0 or b.height == 0:
+            continue
+        X = tokenize_views(a, b)
+        ia = a['_i1'].to_numpy(); ib = b['_i23'].to_numpy()
+        # partition keys: S1 with several states is searched in each of them;
+        # S1 with no known state (e.g. France) is searched against the whole country
+        st1 = a['state'].to_list(); st2 = b['state'].to_list()
+        del a, b
+        groups1 = {}
+        for i, st in enumerate(st1):
+            for g in (set(STATE_ALIAS.get(x, x) for x in st.split()) or {''}):
+                groups1.setdefault(g, []).append(i)
+        g2 = np.array([STATE_ALIAS.get(x, x) if x and ' ' not in x else '' for x in st2])
+        resid = np.nonzero(g2 == '')[0]
+        order2 = np.argsort(g2, kind='stable'); sg2 = g2[order2]
+        parts = []
+        for g, rows in groups1.items():
+            rows1 = np.asarray(rows, dtype=np.int64)
+            if g == '':
+                rows23 = np.arange(len(g2), dtype=np.int64)
+                parts.append(search_block(X, rows1, rows23, ks, caps, threads))
+                continue
+            lo, hi = np.searchsorted(sg2, g, 'left'), np.searchsorted(sg2, g, 'right')
+            parts.append(search_block(X, rows1, np.sort(order2[lo:hi]), ks, caps, threads))
+            parts.append(search_block(X, rows1, resid, resid_ks, caps, threads))
+        u = pl.concat([p for p in parts if p is not None]).unique(['r', 'c'])
+        u = u.select(pl.Series('i1', ia[u['r'].to_numpy()].astype(np.int32)),
+                     pl.Series('i23', ib[u['c'].to_numpy()].astype(np.int32)),
+                     'blk_name', 'blk_addr', ((pl.col('blk_name') + pl.col('blk_addr')) / 2).alias('blk_joint'))
+        u = u.with_columns([pl.col(f'blk_{v}').rank('ordinal', descending=True).over('i1').cast(pl.Int16)
+                            .alias(f'rk_{v}') for v in ('joint', 'name', 'addr')])
+        u = u.filter((pl.col('rk_joint') <= keep[0]) | (pl.col('rk_name') <= keep[1]) | (pl.col('rk_addr') <= keep[2]))
+        if verbose:
+            print(f'  blocking {country}: {len(ia)} x {len(ib)} -> {u.height} pairs '
+                  f'({u.height / len(ia):.1f}/S1), {len(groups1)} geo blocks, {time.time()-t0:.0f}s', flush=True)
+        out.append(u)
+        del X
+    return pl.concat(out)

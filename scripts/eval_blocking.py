@@ -7,23 +7,25 @@ from ber.blocking import generate_candidates
 from ber.io import read_ground_truth
 
 ap = argparse.ArgumentParser(); ap.add_argument('--n', type=int, default=50000); ap.add_argument('--art', default='artifacts')
-ap.add_argument('--kn', type=int, default=20); ap.add_argument('--ka', type=int, default=20)
+ap.add_argument('--kn', type=int, default=15); ap.add_argument('--ka', type=int, default=15); ap.add_argument('--kj', type=int, default=30)
 ap.add_argument('--maxc', type=int, default=30)
 a = ap.parse_args()
 from ber.blocking import BLOCK_COLS
 s1 = pl.read_parquet(f'{a.art}/train_s1.parquet', columns=BLOCK_COLS).sample(a.n, seed=0)
 s23 = pl.concat([pl.read_parquet(f'{a.art}/train_s{i}.parquet', columns=BLOCK_COLS) for i in (2, 3)])
-_, pairs = read_ground_truth('data/train/train_ground_truth.tsv')
 t = time.time()
-c = generate_candidates(s1, s23, a.kn, a.ka, a.maxc)
+c = generate_candidates(s1, s23, a.kn, a.ka, a.kj)
 print('time', time.time() - t)
+s23 = s23.select('entity_id'); import gc; gc.collect()
+_, pairs = read_ground_truth('data/train/train_ground_truth.tsv')
 c = c.with_columns(pl.Series('s1', s1['entity_id'].to_numpy()[c['i1'].to_numpy()]), pl.Series('s23', s23['entity_id'].to_numpy()[c['i23'].to_numpy()]))
 tp = pairs.filter(pl.col('source1_entity_id').is_in(s1['entity_id'].implode()))
 hit = tp.join(c, left_on=['source1_entity_id', 'matched_entity_id'], right_on=['s1', 's23'], how='left')
 print('true pairs', tp.height, 'recall', hit['blk_joint'].is_not_null().mean(), 'cands/S1', c.height / a.n)
 c = c.join(tp.with_columns(pl.lit(1).alias('y')), left_on=['s1', 's23'], right_on=['source1_entity_id', 'matched_entity_id'], how='left').fill_null(0)
-for m in (5, 10, 15, 20, 25, 30):
+for m in (10, 20, 30, 40, 60):
     cc = c.sort(['i1', 'blk_joint'], descending=[False, True]).group_by('i1', maintain_order=True).head(m)
     print(f' top{m} by joint: recall {cc["y"].sum()/tp.height:.4f}')
+c.write_parquet('/tmp/claude-0/cands_eval.parquet')
 miss = hit.filter(pl.col('blk_joint').is_null()).head(3000)
 miss.write_parquet('/tmp/claude-0/miss.parquet')
